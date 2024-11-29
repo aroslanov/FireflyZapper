@@ -58,6 +58,38 @@ To remove fireflies from an image named `input.jpg` and save the result as `outp
 python zap.py input.jpg output.png --window_size 7 --threshold 2.5
 ```
 
+## Running on Image Sequences
+
+If you have a sequence of images and want to apply the firefly removal script to all of them, you can use a loop in the command line.
+
+### For Windows
+
+You can use PowerShell or Command Prompt. Here's an example using PowerShell:
+
+```powershell
+# Navigate to the directory containing your images
+cd path\to\your\images
+
+# Loop through each image file and apply zap.py
+foreach ($file in Get-ChildItem -Filter *.jpg) {
+    python ..\path\to\zap.py $file.FullName "$($file.BaseName)_processed.jpg" --window_size 7 --threshold 2.5
+}
+```
+
+### For macOS/Linux
+
+You can use a shell script or directly run the commands in the terminal:
+
+```bash
+# Navigate to the directory containing your images
+cd path/to/your/images
+
+# Loop through each image file and apply zap.py
+for file in *.jpg; do
+    python ../path/to/zap.py "$file" "${file%.jpg}_processed.jpg" --window_size 7 --threshold 2.5
+done
+```
+
 ## How It Works
 
 1. **Reading the Image**: The script reads the input image using OpenCV.
@@ -76,7 +108,3 @@ Contributions to this project are welcome! If you have any improvements, bug fix
 ## License
 
 This script is released under the MIT License. See the [LICENSE](LICENSE) file for more details.
-
----
-
-Feel free to customize this README further based on any specific requirements or additional information you might want to include!
