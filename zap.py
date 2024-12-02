@@ -37,6 +37,10 @@ def process_channel(channel, window_size, threshold):
     mean = cv2.blur(channel_float, ksize)
     squared = cv2.blur(channel_float ** 2, ksize)
     variance = squared - (mean ** 2)
+
+    # Ensure variance is non-negative to avoid invalid sqrt
+    variance[variance < 0] = 0
+
     std = np.sqrt(variance)
 
     # Avoid division by zero
