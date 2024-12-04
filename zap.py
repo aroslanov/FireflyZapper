@@ -5,16 +5,28 @@ import OpenEXR
 import Imath
 import os
 
+# Constants for supported extensions and default values
+SUPPORTED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.bmp', '.exr']
+WINDOW_SIZE_DEFAULT = 5
+THRESHOLD_DEFAULT = 3.0
+
 def read_exr(filename):
-    """Reads an EXR file and returns a NumPy array."""
+    """
+    Reads an EXR file and returns a NumPy array containing the image data.
+
+    Args:
+        filename (str): Path to the EXR file.
+
+    Returns:
+        np.ndarray: A NumPy array representing the image in RGB format.
+    """
     exr_file = OpenEXR.InputFile(filename)
     header = exr_file.header()
     
-    dw = header['dataWindow']
-    width = dw.max.x - dw.min.x + 1
-    height = dw.max.y - dw.min.y + 1
+    data_window = header['dataWindow']
+    width = data_window.max.x - data_window.min.x + 1
+    height = data_window.max.y - data_window.min.y + 1
 
-    # Read the channels into a NumPy array
     FLOAT = Imath.PixelType(Imath.PixelType.FLOAT)
     red = np.frombuffer(exr_file.channel('R', FLOAT), dtype=np.float32).reshape(height, width)
     green = np.frombuffer(exr_file.channel('G', FLOAT), dtype=np.float32).reshape(height, width)
@@ -23,32 +35,32 @@ def read_exr(filename):
     return np.dstack((red, green, blue))
 
 def write_exr(filename, data):
-    """Writes a NumPy array to an EXR file."""
-    # Ensure data is float32 and properly shaped
+    """
+    Writes a NumPy array to an EXR file.
+
+    Args:
+        filename (str): Path to the output EXR file.
+        data (np.ndarray): A NumPy array representing the image in RGB format.
+    """
     data = data.astype(np.float32)
     if len(data.shape) == 2:
+        # If the input is a single channel, duplicate it to make it 3-channel
         data = np.dstack((data, data, data))
-    elif data.shape[2] == 4:  # Handle RGBA images
-        data = data[:, :, :3]  # Take only RGB channels
+    elif data.shape[2] == 4:  
+        # If the input has an alpha channel, remove it
+        data = data[:, :, :3]
 
-    # Create header dictionary
     header = OpenEXR.Header(data.shape[1], data.shape[0])
-    
-    # Set the data window
     header['dataWindow'] = Imath.Box2i(Imath.V2i(0, 0), 
                                      Imath.V2i(data.shape[1] - 1, data.shape[0] - 1))
     header['displayWindow'] = header['dataWindow']
-
-    # Set channel formats
+    
     FLOAT = Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
     header['channels'] = dict([(c, FLOAT) for c in "RGB"])
-
-    # Ensure the data is contiguous in memory
-    data = np.ascontiguousarray(data)
     
+    data = np.ascontiguousarray(data)
     out = OpenEXR.OutputFile(filename, header)
 
-    # Write the channels separately
     R = data[:, :, 0].tobytes()
     G = data[:, :, 1].tobytes()
     B = data[:, :, 2].tobytes()
@@ -57,37 +69,44 @@ def write_exr(filename, data):
     out.close()
 
 def process_channel(channel, window_size, threshold):
-    # Ensure float32 for accurate computations
+    """
+    Process a single channel to remove fireflies using local statistics and median filtering.
+
+    Args:
+        channel (np.ndarray): A NumPy array representing the image channel.
+        window_size (int): The size of the window for computing local statistics.
+        threshold (float): Z-score threshold for detecting fireflies.
+
+    Returns:
+        np.ndarray: Processed channel with fireflies removed.
+    """
     channel_float = channel.astype(np.float32)
 
-    # Compute local mean and std
     ksize = (window_size, window_size)
     mean = cv2.blur(channel_float, ksize)
     squared = cv2.blur(channel_float ** 2, ksize)
     variance = squared - (mean ** 2)
-
-    # Ensure variance is non-negative to avoid invalid sqrt
     variance[variance < 0] = 0
-
     std = np.sqrt(variance)
-
-    # Avoid division by zero
     std[std == 0] = 1e-6
 
-    # Calculate z-scores
     z_scores = np.abs((channel_float - mean) / std)
-
-    # Identify fireflies based on threshold
     is_firefly = z_scores > threshold
 
-    # Apply median filter to the entire image
     median_filtered = cv2.medianBlur(channel.astype(np.float32), window_size)
-
-    # Replace firefly pixels with median-filtered values
     result = np.where(is_firefly, median_filtered, channel_float)
     return result
 
 def process_image(input_path, output_path, window_size, threshold):
+    """
+    Process an image to remove fireflies by processing each channel individually.
+
+    Args:
+        input_path (str): Path to the input image file.
+        output_path (str): Path to the output image file.
+        window_size (int): The size of the window for computing local statistics.
+        threshold (float): Z-score threshold for detecting fireflies.
+    """
     if input_path.endswith('.exr'):
         image = read_exr(input_path)
         original_dtype = np.float32
@@ -96,7 +115,6 @@ def process_image(input_path, output_path, window_size, threshold):
         if image is None:
             raise ValueError(f"Failed to read image: {input_path}")
 
-        # Determine the original bit depth
         if image.dtype == np.uint16:
             original_dtype = np.uint16
         elif image.dtype == np.float32:
@@ -106,25 +124,18 @@ def process_image(input_path, output_path, window_size, threshold):
         else:
             raise ValueError(f"Unsupported image type: {image.dtype}")
 
-    # Convert to float32 for processing
     if original_dtype == np.uint16:
         image = image.astype(np.float32) / 65535.0
     elif original_dtype == np.uint8:
         image = image.astype(np.float32) / 255.0
 
     if len(image.shape) == 3:
-        # Color image: process each channel separately
         channels = cv2.split(image)
-        processed_channels = []
-        for chan in channels:
-            processed_chan = process_channel(chan, window_size, threshold)
-            processed_channels.append(processed_chan)
+        processed_channels = [process_channel(chan, window_size, threshold) for chan in channels]
         result = cv2.merge(processed_channels)
     else:
-        # Grayscale image
         result = process_channel(image, window_size, threshold)
 
-    # Scale the result back to the original bit depth
     if original_dtype == np.uint16:
         result = (result * 65535).astype(np.uint16)
     elif original_dtype == np.uint8:
@@ -139,25 +150,33 @@ def process_image(input_path, output_path, window_size, threshold):
         raise RuntimeError(f"Failed to write output image: {str(e)}")
 
 def handle_same_directory(input_dir, output_dir):
+    """
+    Handle the case where input and output directories are the same.
+
+    Args:
+        input_dir (str): Path to the input directory.
+        output_dir (str): Path to the output directory.
+
+    Returns:
+        tuple: Updated paths for input and output directories and a prefix if applicable.
+    """
     while input_dir == output_dir:
         print("Input and output directories are the same. This will overwrite source files.")
         user_choice = input("Enter 'n' for a new output directory, 'p' for an output file prefix, or 'o' to overwrite: ").strip().lower()
         
         if user_choice == 'n':
             output_dir = input("Enter new output directory path: ").strip()
-            if not os.path.exists(output_dir):
-                try:
-                    os.makedirs(output_dir)
-                    print(f"Created new output directory: {output_dir}")
-                except Exception as e:
-                    print(f"Failed to create directory: {str(e)}")
-                    continue
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+                print(f"Created new output directory: {output_dir}")
+            except Exception as e:
+                print(f"Failed to create directory: {str(e)}")
         elif user_choice == 'p':
             prefix = input("Enter the output file prefix: ").strip()
             if not prefix:
                 print("Prefix cannot be empty. Please enter a valid prefix.")
-                continue
-            return input_dir, None, prefix
+            else:
+                return input_dir, None, prefix
         elif user_choice == 'o':
             print("Overwriting files in the same directory.")
             return input_dir, input_dir, None
@@ -166,9 +185,21 @@ def handle_same_directory(input_dir, output_dir):
     
     return input_dir, output_dir, None
 
-def get_output_path(input_path, output_dir):
-    """Determine the output path based on the input file extension."""
+def get_output_path(input_path, output_dir, prefix=None):
+    """
+    Determine the output path based on the input file extension and any specified prefix.
+
+    Args:
+        input_path (str): Path to the input image file.
+        output_dir (str): Path to the output directory.
+        prefix (str, optional): Prefix for the output file name. Defaults to None.
+
+    Returns:
+        str: Full path to the output image file.
+    """
     filename = os.path.basename(input_path)
+    if prefix:
+        filename = f"{prefix}{filename}"
     name, ext = os.path.splitext(filename)
     output_filename = f"{name}_processed{ext}"
     return os.path.join(output_dir, output_filename)
@@ -177,15 +208,16 @@ def main():
     parser = argparse.ArgumentParser(description='Firefly removal from images.')
     parser.add_argument('input', type=str, help='Input directory or image file')
     parser.add_argument('output', type=str, help='Output directory or image file')
-    parser.add_argument('--window_size', type=int, default=5, help='Window size for local statistics')
-    parser.add_argument('--threshold', type=float, default=3.0, help='Z-score threshold for firefly detection')
+    parser.add_argument('--window_size', type=int, default=WINDOW_SIZE_DEFAULT, help='Window size for local statistics')
+    parser.add_argument('--threshold', type=float, default=THRESHOLD_DEFAULT, help='Z-score threshold for firefly detection')
 
     args = parser.parse_args()
 
     input_path = os.path.abspath(args.input)
     output_path = os.path.abspath(args.output)
 
-    supported_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.exr']
+    if not os.path.exists(input_path):
+        raise ValueError(f"Input path does not exist: {input_path}")
 
     if os.path.isdir(input_path):
         input_dir = input_path
@@ -195,26 +227,15 @@ def main():
 
         for filename in os.listdir(input_dir):
             input_file_path = os.path.join(input_dir, filename)
-            if any(input_file_path.endswith(ext) for ext in supported_extensions):
-                if prefix:
-                    output_filename = f"{prefix}{filename}"
-                else:
-                    output_filename = filename
-
-                # Determine the correct output path based on whether output_dir is None or not
-                if output_dir:
-                    output_file_path = os.path.join(output_dir, output_filename)
-                else:
-                    output_file_path = os.path.join(input_dir, output_filename)
-
+            if any(input_file_path.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
+                output_filename = get_output_path(input_file_path, output_dir, prefix)
                 print(f"Processing {input_file_path}...")
-                process_image(input_file_path, output_file_path, args.window_size, args.threshold)
+                process_image(input_file_path, output_filename, args.window_size, args.threshold)
     elif os.path.isfile(input_path):
-        if any(input_path.endswith(ext) for ext in supported_extensions):
+        if any(input_path.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
             input_dir = os.path.dirname(input_path)
             output_dir = os.path.dirname(output_path)
 
-            # Check if the output is a directory
             if os.path.isdir(output_path):
                 output_file_path = get_output_path(input_path, output_path)
             else:
