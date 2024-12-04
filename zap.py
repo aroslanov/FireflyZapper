@@ -3,6 +3,7 @@ import numpy as np
 import argparse
 import OpenEXR
 import Imath
+import os
 
 def read_exr(filename):
     """Reads an EXR file and returns a NumPy array."""
@@ -55,43 +56,6 @@ def write_exr(filename, data):
     out.writePixels({'R': R, 'G': G, 'B': B})
     out.close()
 
-def main():
-    parser = argparse.ArgumentParser(description='Firefly removal from images.')
-    parser.add_argument('input', type=str, help='Input image file')
-    parser.add_argument('output', type=str, help='Output image file')
-    parser.add_argument('--window_size', type=int, default=5, help='Window size for local statistics')
-    parser.add_argument('--threshold', type=float, default=3.0, help='Z-score threshold for firefly detection')
-
-    args = parser.parse_args()
-
-    if args.input.endswith('.exr'):
-        image = read_exr(args.input)
-    else:
-        image = cv2.imread(args.input, cv2.IMREAD_UNCHANGED)
-        if image is None:
-            raise ValueError(f"Failed to read image: {args.input}")
-
-    if len(image.shape) == 3:
-        # Color image: process each channel separately
-        channels = cv2.split(image)
-        processed_channels = []
-        for chan in channels:
-            processed_chan = process_channel(chan, args.window_size, args.threshold)
-            processed_channels.append(processed_chan)
-        result = cv2.merge(processed_channels)
-    else:
-        # Grayscale image
-        result = process_channel(image, args.window_size, args.threshold)
-
-    try:
-        if args.output.endswith('.exr'):
-            write_exr(args.output, result)
-        else:
-            cv2.imwrite(args.output, result)
-    except Exception as e:
-        raise RuntimeError(f"Failed to write output image: {str(e)}")
-
-
 def process_channel(channel, window_size, threshold):
     # Ensure float32 for accurate computations
     channel_float = channel.astype(np.float32)
@@ -123,6 +87,145 @@ def process_channel(channel, window_size, threshold):
     result = np.where(is_firefly, median_filtered, channel_float)
     return result
 
+def process_image(input_path, output_path, window_size, threshold):
+    if input_path.endswith('.exr'):
+        image = read_exr(input_path)
+        original_dtype = np.float32
+    else:
+        image = cv2.imread(input_path, cv2.IMREAD_UNCHANGED)
+        if image is None:
+            raise ValueError(f"Failed to read image: {input_path}")
+
+        # Determine the original bit depth
+        if image.dtype == np.uint16:
+            original_dtype = np.uint16
+        elif image.dtype == np.float32:
+            original_dtype = np.float32
+        elif image.dtype == np.uint8:
+            original_dtype = np.uint8
+        else:
+            raise ValueError(f"Unsupported image type: {image.dtype}")
+
+    # Convert to float32 for processing
+    if original_dtype == np.uint16:
+        image = image.astype(np.float32) / 65535.0
+    elif original_dtype == np.uint8:
+        image = image.astype(np.float32) / 255.0
+
+    if len(image.shape) == 3:
+        # Color image: process each channel separately
+        channels = cv2.split(image)
+        processed_channels = []
+        for chan in channels:
+            processed_chan = process_channel(chan, window_size, threshold)
+            processed_channels.append(processed_chan)
+        result = cv2.merge(processed_channels)
+    else:
+        # Grayscale image
+        result = process_channel(image, window_size, threshold)
+
+    # Scale the result back to the original bit depth
+    if original_dtype == np.uint16:
+        result = (result * 65535).astype(np.uint16)
+    elif original_dtype == np.uint8:
+        result = (result * 255).astype(np.uint8)
+
+    try:
+        if output_path.endswith('.exr'):
+            write_exr(output_path, result)
+        else:
+            cv2.imwrite(output_path, result)
+    except Exception as e:
+        raise RuntimeError(f"Failed to write output image: {str(e)}")
+
+def handle_same_directory(input_dir, output_dir):
+    while input_dir == output_dir:
+        print("Input and output directories are the same. This will overwrite source files.")
+        user_choice = input("Enter 'n' for a new output directory, 'p' for an output file prefix, or 'o' to overwrite: ").strip().lower()
+        
+        if user_choice == 'n':
+            output_dir = input("Enter new output directory path: ").strip()
+            if not os.path.exists(output_dir):
+                try:
+                    os.makedirs(output_dir)
+                    print(f"Created new output directory: {output_dir}")
+                except Exception as e:
+                    print(f"Failed to create directory: {str(e)}")
+                    continue
+        elif user_choice == 'p':
+            prefix = input("Enter the output file prefix: ").strip()
+            if not prefix:
+                print("Prefix cannot be empty. Please enter a valid prefix.")
+                continue
+            return input_dir, None, prefix
+        elif user_choice == 'o':
+            print("Overwriting files in the same directory.")
+            return input_dir, input_dir, None
+        else:
+            print("Invalid choice. Please enter either 'n' (new), 'p' (prefix), or 'o' (overwrite).")
+    
+    return input_dir, output_dir, None
+
+def get_output_path(input_path, output_dir):
+    """Determine the output path based on the input file extension."""
+    filename = os.path.basename(input_path)
+    name, ext = os.path.splitext(filename)
+    output_filename = f"{name}_processed{ext}"
+    return os.path.join(output_dir, output_filename)
+
+def main():
+    parser = argparse.ArgumentParser(description='Firefly removal from images.')
+    parser.add_argument('input', type=str, help='Input directory or image file')
+    parser.add_argument('output', type=str, help='Output directory or image file')
+    parser.add_argument('--window_size', type=int, default=5, help='Window size for local statistics')
+    parser.add_argument('--threshold', type=float, default=3.0, help='Z-score threshold for firefly detection')
+
+    args = parser.parse_args()
+
+    input_path = os.path.abspath(args.input)
+    output_path = os.path.abspath(args.output)
+
+    supported_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.exr']
+
+    if os.path.isdir(input_path):
+        input_dir = input_path
+        output_dir = output_path
+
+        input_dir, output_dir, prefix = handle_same_directory(input_dir, output_dir)
+
+        for filename in os.listdir(input_dir):
+            input_file_path = os.path.join(input_dir, filename)
+            if any(input_file_path.endswith(ext) for ext in supported_extensions):
+                if prefix:
+                    output_filename = f"{prefix}{filename}"
+                else:
+                    output_filename = filename
+
+                # Determine the correct output path based on whether output_dir is None or not
+                if output_dir:
+                    output_file_path = os.path.join(output_dir, output_filename)
+                else:
+                    output_file_path = os.path.join(input_dir, output_filename)
+
+                print(f"Processing {input_file_path}...")
+                process_image(input_file_path, output_file_path, args.window_size, args.threshold)
+    elif os.path.isfile(input_path):
+        if any(input_path.endswith(ext) for ext in supported_extensions):
+            input_dir = os.path.dirname(input_path)
+            output_dir = os.path.dirname(output_path)
+
+            # Check if the output is a directory
+            if os.path.isdir(output_path):
+                output_file_path = get_output_path(input_path, output_path)
+            else:
+                output_file_path = output_path
+
+            print(f"Processing {input_path}...")
+            process_image(input_path, output_file_path, args.window_size, args.threshold)
+        else:
+            raise ValueError("Invalid input file. Please provide a supported image file.")
+    else:
+        raise ValueError("Invalid input/output paths. Please provide valid directories or files.")
 
 if __name__ == "__main__":
     main()
