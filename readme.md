@@ -79,38 +79,6 @@ python zap.py images images --prefix clean_
 
 This will process all supported images in the `images` directory and save them back into the same directory with the prefix `clean_`.
 
-## Running on Image Sequences
-
-If you have a sequence of images and want to apply the firefly removal script to all of them, you can use a loop in the command line.
-
-### For Windows
-
-You can use PowerShell or Command Prompt. Here's an example using PowerShell:
-
-```powershell
-# Navigate to the directory containing your images
-cd path\to\your\images
-
-# Loop through each image file and apply zap.py
-foreach ($file in Get-ChildItem -Filter *.jpg) {
-    python ..\path\to\zap.py $file.FullName "$($file.BaseName)_processed.jpg" --window_size 7 --threshold 2.5
-}
-```
-
-### For macOS/Linux
-
-You can use a shell script or directly run the commands in the terminal:
-
-```bash
-# Navigate to the directory containing your images
-cd path/to/your/images
-
-# Loop through each image file and apply zap.py
-for file in *.jpg; do
-    python ../path/to/zap.py "$file" "${file%.jpg}_processed.jpg" --window_size 7 --threshold 2.5
-done
-```
-
 ## How It Works
 
 1. **Reading the Image**: The script reads the input image using OpenCV or `OpenEXR` for EXR files.
