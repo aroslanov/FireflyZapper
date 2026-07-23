@@ -1,13 +1,14 @@
 """
 FireflyZapper GUI - PySide6 based graphical interface for firefly removal from images.
 
-Provides visual preview of original, processed image and artifacts mask,
-with customizable parameter presets.
+Supports single image processing and image sequence processing with
+frame scrubbing, navigation, and batch rendering.
 """
 
 import sys
 import os
 import json
+import re
 import numpy as np
 import cv2
 
@@ -16,9 +17,10 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QSlider, QDoubleSpinBox, QSpinBox,
     QFileDialog, QGroupBox, QGridLayout, QSplitter, QTabWidget,
     QListWidget, QListWidgetItem, QLineEdit, QMessageBox,
-    QScrollArea, QFrame, QSizePolicy, QComboBox, QCheckBox
+    QScrollArea, QFrame, QSizePolicy, QComboBox, QCheckBox,
+    QProgressBar, QProgressDialog
 )
-from PySide6.QtCore import Qt, QTimer, Signal, Slot, QByteArray, QBuffer
+from PySide6.QtCore import Qt, QTimer, Signal, Slot, QByteArray, QBuffer, QThread
 from PySide6.QtGui import QPixmap, QImage, QFont
 
 # Import firefly processing from zap.py
@@ -120,7 +122,6 @@ def array_to_qpixmap(arr, normalize=True):
     """Convert a numpy array (float32, [0,1]) to QPixmap."""
     if arr.dtype != np.uint8:
         if normalize:
-            # Normalize to 0-255 for display
             if arr.max() > arr.min():
                 arr = (arr - arr.min()) / (arr.max() - arr.min())
             else:
@@ -130,25 +131,38 @@ def array_to_qpixmap(arr, normalize=True):
     h, w = arr.shape[:2]
 
     if len(arr.shape) == 2:
-        # Grayscale -> RGB
         arr = np.dstack([arr, arr, arr])
 
     if arr.shape[2] == 4:
         arr = arr[:, :, :3]
 
-    # Ensure contiguous
     arr = np.ascontiguousarray(arr)
 
     bytes_per_line = 3 * w
-    qimg = QImage(arr.data, w, h, bytes_per_line, QImage.Format_RGB888)
+    qimg = QImage(arr.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
     return QPixmap.fromImage(qimg)
 
 
 def make_mask_overlay(mask, image_shape):
     """Create a red overlay visualization of the mask."""
     overlay = np.zeros((image_shape[0], image_shape[1], 3), dtype=np.float32)
-    overlay[mask] = [1.0, 0.0, 0.0]  # Red
+    overlay[mask] = [1.0, 0.0, 0.0]
     return overlay
+
+
+def natural_sort_key(filename):
+    """Sort filenames with numbers in natural order (frame_2 before frame_10)."""
+    return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', filename)]
+
+
+def scan_sequence(directory):
+    """Scan a directory for supported image files, sorted naturally."""
+    files = []
+    for f in os.listdir(directory):
+        if any(f.lower().endswith(ext) for ext in SUPPORTED_EXTENSIONS):
+            files.append(f)
+    files.sort(key=natural_sort_key)
+    return [os.path.join(directory, f) for f in files]
 
 
 # ──────────────────────────────────────────────
@@ -192,6 +206,70 @@ class PresetManager:
 
 
 # ──────────────────────────────────────────────
+# Render Worker Thread
+# ──────────────────────────────────────────────
+class RenderWorker(QThread):
+    """Processes a sequence of frames in a background thread."""
+    progress = Signal(int, str)   # frame_index, filename
+    frame_done = Signal(int, int) # frame_index, total_frames
+    finished = Signal()
+    error = Signal(str)
+
+    def __init__(self, frame_paths, output_dir, window_size, threshold, original_dtype):
+        super().__init__()
+        self.frame_paths = frame_paths
+        self.output_dir = output_dir
+        self.window_size = window_size
+        self.threshold = threshold
+        self.original_dtype = original_dtype
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        total = len(self.frame_paths)
+        for i, fpath in enumerate(self.frame_paths):
+            if self._cancelled:
+                return
+
+            basename = os.path.basename(fpath)
+            self.progress.emit(i, basename)
+
+            try:
+                image, _ = load_image(fpath)
+                result, _ = process_image_full(image, self.window_size, self.threshold)
+
+                # Convert back to original dtype
+                result_out = result.copy()
+                if self.original_dtype == np.uint16:
+                    result_out = (np.clip(result_out, 0, 1) * 65535).astype(np.uint16)
+                elif self.original_dtype == np.uint8:
+                    result_out = (np.clip(result_out, 0, 1) * 255).astype(np.uint8)
+
+                # Build output path
+                name, ext = os.path.splitext(basename)
+                out_name = f"{name}_processed{ext}"
+                out_path = os.path.join(self.output_dir, out_name)
+
+                if out_path.lower().endswith('.exr'):
+                    write_exr(out_path, result_out)
+                else:
+                    save_img = result_out
+                    if len(save_img.shape) == 3 and save_img.shape[2] >= 3:
+                        save_img = save_img[:, :, ::-1]  # RGB -> BGR
+                    cv2.imwrite(out_path, save_img)
+
+            except Exception as e:
+                self.error.emit(f"Failed on {basename}: {str(e)}")
+                continue
+
+            self.frame_done.emit(i + 1, total)
+
+        self.finished.emit()
+
+
+# ──────────────────────────────────────────────
 # Image Preview Widget
 # ──────────────────────────────────────────────
 class ImagePreview(QLabel):
@@ -199,9 +277,9 @@ class ImagePreview(QLabel):
     def __init__(self, title="", parent=None):
         super().__init__(parent)
         self.title = title
-        self.setAlignment(Qt.AlignCenter)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(200, 150)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setStyleSheet("""
             QLabel {
                 background-color: #1e1e1e;
@@ -226,7 +304,7 @@ class ImagePreview(QLabel):
         if self._pixmap is None:
             return
         scaled = self._pixmap.scaled(
-            self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
         )
         self.setPixmap(scaled)
         self.setText("")
@@ -243,15 +321,23 @@ class FireflyZapperGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("FireflyZapper")
-        self.setMinimumSize(1200, 750)
+        self.setMinimumSize(1300, 800)
 
-        # State
+        # ── Single image state ──
         self.image_path = None
         self.original_image = None
         self.original_dtype = None
         self.processed_image = None
         self.artifacts_mask = None
+
+        # ── Sequence state ──
+        self.sequence_paths = []       # list of full file paths
+        self.sequence_dir = None       # source directory
+        self.current_frame_index = 0
+        self.is_sequence_mode = False
+
         self.preset_manager = PresetManager()
+        self.render_worker = None
 
         # Central widget
         central = QWidget()
@@ -262,14 +348,16 @@ class FireflyZapperGUI(QMainWindow):
 
         # ── Left panel: Controls ──
         left_panel = QWidget()
-        left_panel.setFixedWidth(320)
+        left_panel.setFixedWidth(340)
         left_layout = QVBoxLayout(left_panel)
         left_layout.setSpacing(8)
 
         self._build_file_section(left_layout)
+        self._build_sequence_section(left_layout)
         self._build_parameter_section(left_layout)
         self._build_preset_section(left_layout)
         self._build_action_section(left_layout)
+        self._set_sequence_controls_enabled(False)
         left_layout.addStretch()
 
         # ── Right panel: Previews ──
@@ -313,19 +401,18 @@ class FireflyZapperGUI(QMainWindow):
         self.preview_tabs.addTab(self.tab_processed_only, "Processed")
 
         # Status bar
-        self.status_label = QLabel("Ready — open an image to begin")
+        self.status_label = QLabel("Ready — open an image or sequence folder to begin")
         self.status_label.setStyleSheet("color: #aaa; padding: 2px;")
         right_layout.addWidget(self.status_label)
 
         # Splitter
-        splitter = QSplitter(Qt.Horizontal)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         main_layout.addWidget(splitter)
 
-        # Apply dark theme
         self._apply_theme()
 
     # ── UI Builders ──
@@ -384,6 +471,21 @@ class FireflyZapperGUI(QMainWindow):
             QPushButton#btn_save:hover {
                 background-color: #3a7a9a;
             }
+            QPushButton#btn_render {
+                background-color: #7a5a2a;
+                border-color: #9a7a3a;
+                font-weight: bold;
+                padding: 10px;
+                font-size: 14px;
+            }
+            QPushButton#btn_render:hover {
+                background-color: #9a7a3a;
+            }
+            QPushButton#btn_render:disabled {
+                background-color: #444;
+                border-color: #555;
+                color: #777;
+            }
             QSlider::groove:horizontal {
                 height: 6px;
                 background: #444;
@@ -435,24 +537,95 @@ class FireflyZapperGUI(QMainWindow):
                 background-color: #2d2d2d;
                 border-bottom: 1px solid #2d2d2d;
             }
-            QLabel#status {
-                color: #aaa;
+            QProgressBar {
+                border: 1px solid #555;
+                border-radius: 4px;
+                text-align: center;
+                background-color: #333;
+                color: #e0e0e0;
+            }
+            QProgressBar::chunk {
+                background-color: #2a6d2a;
+                border-radius: 3px;
             }
         """)
 
     def _build_file_section(self, layout):
-        group = QGroupBox("Image File")
+        group = QGroupBox("Input")
         gl = QVBoxLayout(group)
         gl.setSpacing(6)
 
-        btn_open = QPushButton("📂 Open Image...")
-        btn_open.clicked.connect(self._on_open_image)
-        gl.addWidget(btn_open)
+        hrow = QHBoxLayout()
+        btn_open_image = QPushButton("📷 Open Image")
+        btn_open_image.clicked.connect(self._on_open_image)
+        hrow.addWidget(btn_open_image)
+
+        btn_open_seq = QPushButton("🎞️ Open Sequence")
+        btn_open_seq.clicked.connect(self._on_open_sequence)
+        hrow.addWidget(btn_open_seq)
+        gl.addLayout(hrow)
 
         self.file_label = QLabel("No file selected")
         self.file_label.setWordWrap(True)
         self.file_label.setStyleSheet("color: #999; font-size: 12px;")
         gl.addWidget(self.file_label)
+
+        layout.addWidget(group)
+
+    def _build_sequence_section(self, layout):
+        group = QGroupBox("Sequence Controls")
+        self.seq_group = group
+        gl = QVBoxLayout(group)
+        gl.setSpacing(4)
+
+        # Frame counter
+        self.frame_label = QLabel("Frame: — / —")
+        self.frame_label.setStyleSheet("font-weight: bold; font-size: 14px; color: #ddd;")
+        gl.addWidget(self.frame_label)
+
+        # Scrubber slider
+        self.frame_slider = QSlider(Qt.Orientation.Horizontal)
+        self.frame_slider.setMinimum(0)
+        self.frame_slider.setMaximum(0)
+        self.frame_slider.setValue(0)
+        self.frame_slider.valueChanged.connect(self._on_frame_slider_changed)
+        gl.addWidget(self.frame_slider)
+
+        # Navigation buttons
+        nav_row = QHBoxLayout()
+        self.btn_first = QPushButton("⏮ First")
+        self.btn_first.clicked.connect(lambda: self._go_to_frame(0))
+        nav_row.addWidget(self.btn_first)
+
+        self.btn_prev = QPushButton("◀ Prev")
+        self.btn_prev.clicked.connect(self._on_prev_frame)
+        nav_row.addWidget(self.btn_prev)
+
+        self.btn_next = QPushButton("Next ▶")
+        self.btn_next.clicked.connect(self._on_next_frame)
+        nav_row.addWidget(self.btn_next)
+
+        self.btn_last = QPushButton("Last ⏭")
+        self.btn_last.clicked.connect(lambda: self._go_to_frame(-1))
+        nav_row.addWidget(self.btn_last)
+        gl.addLayout(nav_row)
+
+        # Output dir for render
+        render_dir_row = QHBoxLayout()
+        render_dir_row.addWidget(QLabel("Output:"))
+        self.render_dir_edit = QLineEdit()
+        self.render_dir_edit.setPlaceholderText("Same as source (append _processed)")
+        render_dir_row.addWidget(self.render_dir_edit)
+        btn_browse_render = QPushButton("Browse")
+        btn_browse_render.clicked.connect(self._on_browse_render_dir)
+        render_dir_row.addWidget(btn_browse_render)
+        gl.addLayout(render_dir_row)
+
+        # Render progress
+        self.render_progress = QProgressBar()
+        self.render_progress.setVisible(False)
+        self.render_progress.setValue(0)
+        gl.addWidget(self.render_progress)
 
         layout.addWidget(group)
 
@@ -466,11 +639,11 @@ class FireflyZapperGUI(QMainWindow):
         self.window_size_spin = QSpinBox()
         self.window_size_spin.setRange(WINDOW_SIZE_MIN, WINDOW_SIZE_MAX)
         self.window_size_spin.setValue(WINDOW_SIZE_DEFAULT)
-        self.window_size_spin.setSingleStep(2)  # Keep odd
+        self.window_size_spin.setSingleStep(2)
         self.window_size_spin.valueChanged.connect(self._on_param_changed)
         gl.addWidget(self.window_size_spin, 0, 1)
 
-        self.window_size_slider = QSlider(Qt.Horizontal)
+        self.window_size_slider = QSlider(Qt.Orientation.Horizontal)
         self.window_size_slider.setRange(WINDOW_SIZE_MIN, WINDOW_SIZE_MAX)
         self.window_size_slider.setValue(WINDOW_SIZE_DEFAULT)
         self.window_size_slider.setSingleStep(2)
@@ -487,7 +660,7 @@ class FireflyZapperGUI(QMainWindow):
         self.threshold_spin.valueChanged.connect(self._on_param_changed)
         gl.addWidget(self.threshold_spin, 1, 1)
 
-        self.threshold_slider = QSlider(Qt.Horizontal)
+        self.threshold_slider = QSlider(Qt.Orientation.Horizontal)
         self.threshold_slider.setRange(int(THRESHOLD_MIN * 10), int(THRESHOLD_MAX * 10))
         self.threshold_slider.setValue(int(THRESHOLD_DEFAULT * 10))
         self.threshold_slider.valueChanged.connect(
@@ -505,13 +678,11 @@ class FireflyZapperGUI(QMainWindow):
         gl = QVBoxLayout(group)
         gl.setSpacing(4)
 
-        # Preset list
         self.preset_list = QListWidget()
         self.preset_list.setMaximumHeight(120)
         self.preset_list.itemClicked.connect(self._on_preset_selected)
         gl.addWidget(self.preset_list)
 
-        # Preset controls
         hbox = QHBoxLayout()
         self.preset_name_edit = QLineEdit()
         self.preset_name_edit.setPlaceholderText("Preset name...")
@@ -526,7 +697,6 @@ class FireflyZapperGUI(QMainWindow):
         hbox.addWidget(btn_delete_preset)
         gl.addLayout(hbox)
 
-        # Default presets dropdown
         hbox2 = QHBoxLayout()
         hbox2.addWidget(QLabel("Quick:"))
         self.quick_preset_combo = QComboBox()
@@ -549,25 +719,88 @@ class FireflyZapperGUI(QMainWindow):
         gl = QVBoxLayout(group)
         gl.setSpacing(6)
 
-        # Auto-preview checkbox
         self.auto_preview_cb = QCheckBox("Auto-preview on parameter change")
         self.auto_preview_cb.setChecked(True)
         gl.addWidget(self.auto_preview_cb)
 
-        # Process button
-        self.btn_process = QPushButton("⚡ Process")
+        self.btn_process = QPushButton("⚡ Process Current Frame")
         self.btn_process.setObjectName("btn_process")
         self.btn_process.clicked.connect(self._on_process)
         gl.addWidget(self.btn_process)
 
-        # Save button
-        self.btn_save = QPushButton("💾 Save Result As...")
+        self.btn_save = QPushButton("💾 Save Current Frame As...")
         self.btn_save.setObjectName("btn_save")
         self.btn_save.clicked.connect(self._on_save)
         self.btn_save.setEnabled(False)
         gl.addWidget(self.btn_save)
 
+        self.btn_render = QPushButton("🎬 Render Sequence")
+        self.btn_render.setObjectName("btn_render")
+        self.btn_render.clicked.connect(self._on_render_sequence)
+        self.btn_render.setEnabled(False)
+        gl.addWidget(self.btn_render)
+
         layout.addWidget(group)
+
+    # ── Sequence helpers ──
+
+    def _set_sequence_controls_enabled(self, enabled):
+        self.frame_slider.setEnabled(enabled)
+        self.btn_first.setEnabled(enabled)
+        self.btn_prev.setEnabled(enabled)
+        self.btn_next.setEnabled(enabled)
+        self.btn_last.setEnabled(enabled)
+        self.btn_render.setEnabled(enabled)
+
+    def _update_frame_display(self):
+        if not self.is_sequence_mode or not self.sequence_paths:
+            self.frame_label.setText("Frame: — / —")
+            return
+        total = len(self.sequence_paths)
+        current = self.current_frame_index + 1  # 1-based for display
+        basename = os.path.basename(self.sequence_paths[self.current_frame_index])
+        self.frame_label.setText(f"Frame: {current} / {total}  —  {basename}")
+
+    def _load_current_frame(self):
+        """Load the current frame from the sequence into the preview."""
+        if not self.is_sequence_mode or not self.sequence_paths:
+            return
+        fpath = self.sequence_paths[self.current_frame_index]
+        try:
+            self.image_path = fpath
+            self.original_image, self.original_dtype = load_image(fpath)
+            self.file_label.setText(f"[Sequence] {os.path.basename(os.path.dirname(fpath))}")
+
+            self.preview_original.set_image(self.original_image)
+            self.preview_original_only.set_image(self.original_image)
+
+            self.processed_image = None
+            self.artifacts_mask = None
+            self.preview_processed.clear()
+            self.preview_processed_only.clear()
+            self.preview_mask.clear()
+            self.btn_save.setEnabled(False)
+
+            self._update_frame_display()
+
+            if self.auto_preview_cb.isChecked():
+                self._on_process()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load frame:\n{str(e)}")
+
+    def _go_to_frame(self, index):
+        if not self.sequence_paths:
+            return
+        if index < 0:
+            index = len(self.sequence_paths) - 1
+        index = max(0, min(index, len(self.sequence_paths) - 1))
+        if index != self.current_frame_index:
+            self.current_frame_index = index
+            self.frame_slider.blockSignals(True)
+            self.frame_slider.setValue(index)
+            self.frame_slider.blockSignals(False)
+            self._load_current_frame()
 
     # ── Slots ──
 
@@ -579,17 +812,23 @@ class FireflyZapperGUI(QMainWindow):
         if not filepath:
             return
 
+        # Switch to single image mode
+        self.is_sequence_mode = False
+        self.sequence_paths = []
+        self._set_sequence_controls_enabled(False)
+        self.render_progress.setVisible(False)
+
         try:
             self.image_path = filepath
             self.original_image, self.original_dtype = load_image(filepath)
             self.file_label.setText(os.path.basename(filepath))
-            self.status_label.setText(f"Loaded: {os.path.basename(filepath)} ({self.original_image.shape[1]}×{self.original_image.shape[0]})")
+            self.status_label.setText(
+                f"Loaded: {os.path.basename(filepath)} ({self.original_image.shape[1]}×{self.original_image.shape[0]})"
+            )
 
-            # Show original
             self.preview_original.set_image(self.original_image)
             self.preview_original_only.set_image(self.original_image)
 
-            # Clear processed
             self.processed_image = None
             self.artifacts_mask = None
             self.preview_processed.clear()
@@ -597,7 +836,8 @@ class FireflyZapperGUI(QMainWindow):
             self.preview_mask.clear()
             self.btn_save.setEnabled(False)
 
-            # Auto-process if auto-preview is on
+            self._update_frame_display()
+
             if self.auto_preview_cb.isChecked():
                 self._on_process()
 
@@ -605,9 +845,60 @@ class FireflyZapperGUI(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to load image:\n{str(e)}")
             self.status_label.setText(f"Error: {str(e)}")
 
+    def _on_open_sequence(self):
+        directory = QFileDialog.getExistingDirectory(
+            self, "Open Image Sequence Folder", ""
+        )
+        if not directory:
+            return
+
+        files = scan_sequence(directory)
+        if not files:
+            QMessageBox.warning(self, "Warning", f"No supported images found in:\n{directory}")
+            return
+
+        self.is_sequence_mode = True
+        self.sequence_paths = files
+        self.sequence_dir = directory
+        self.current_frame_index = 0
+
+        # Enable sequence controls
+        self._set_sequence_controls_enabled(True)
+        self.frame_slider.setMaximum(len(files) - 1)
+        self.frame_slider.setValue(0)
+        self.render_progress.setVisible(False)
+        self.render_progress.setValue(0)
+
+        self.file_label.setText(f"[Sequence] {os.path.basename(directory)} — {len(files)} frames")
+        self.status_label.setText(f"Loaded sequence: {len(files)} frames from {os.path.basename(directory)}")
+
+        # Set default render output dir
+        self.render_dir_edit.setText("")
+
+        self._load_current_frame()
+
+    def _on_frame_slider_changed(self, value):
+        if not self.sequence_paths:
+            return
+        if value != self.current_frame_index:
+            self.current_frame_index = value
+            self._load_current_frame()
+
+    def _on_prev_frame(self):
+        self._go_to_frame(self.current_frame_index - 1)
+
+    def _on_next_frame(self):
+        self._go_to_frame(self.current_frame_index + 1)
+
+    def _on_browse_render_dir(self):
+        directory = QFileDialog.getExistingDirectory(
+            self, "Select Render Output Directory", ""
+        )
+        if directory:
+            self.render_dir_edit.setText(directory)
+
     def _on_param_changed(self):
         if self.original_image is not None and self.auto_preview_cb.isChecked():
-            # Debounce via timer
             try:
                 self._debounce_timer
             except AttributeError:
@@ -618,7 +909,7 @@ class FireflyZapperGUI(QMainWindow):
 
     def _on_process(self):
         if self.original_image is None:
-            QMessageBox.warning(self, "Warning", "Please open an image first.")
+            QMessageBox.warning(self, "Warning", "Please open an image or sequence first.")
             return
 
         ws = self.window_size_spin.value()
@@ -632,18 +923,13 @@ class FireflyZapperGUI(QMainWindow):
             self.processed_image = result
             self.artifacts_mask = mask
 
-            # Update previews
             self.preview_processed.set_image(result)
             self.preview_processed_only.set_image(result)
 
-            # Mask visualization
-            mask_vis = make_mask_overlay(mask, self.original_image.shape)
-            # Blend with original for context
             blended = self.original_image.copy()
             blended[mask] = blended[mask] * 0.4 + np.array([1.0, 0.0, 0.0]) * 0.6
             self.preview_mask.set_image(blended)
 
-            # Count fireflies
             num_fireflies = int(np.sum(mask))
             total_pixels = mask.size
             pct = 100.0 * num_fireflies / total_pixels
@@ -661,7 +947,6 @@ class FireflyZapperGUI(QMainWindow):
         if self.processed_image is None:
             return
 
-        # Determine default extension
         if self.image_path and self.image_path.lower().endswith('.exr'):
             default_ext = ".exr"
             filter_str = "EXR (*.exr);;PNG (*.png);;JPEG (*.jpg);;BMP (*.bmp)"
@@ -669,16 +954,16 @@ class FireflyZapperGUI(QMainWindow):
             default_ext = ".png"
             filter_str = "PNG (*.png);;JPEG (*.jpg);;BMP (*.bmp);;EXR (*.exr)"
 
+        assert self.image_path is not None
         default_name = os.path.splitext(os.path.basename(self.image_path))[0] + "_processed" + default_ext
 
-        filepath, selected_filter = QFileDialog.getSaveFileName(
+        filepath, _ = QFileDialog.getSaveFileName(
             self, "Save Processed Image", default_name, filter_str
         )
         if not filepath:
             return
 
         try:
-            # Convert back to original dtype
             result_out = self.processed_image.copy()
             if self.original_dtype == np.uint16:
                 result_out = (np.clip(result_out, 0, 1) * 65535).astype(np.uint16)
@@ -686,18 +971,92 @@ class FireflyZapperGUI(QMainWindow):
                 result_out = (np.clip(result_out, 0, 1) * 255).astype(np.uint8)
 
             if filepath.lower().endswith('.exr'):
-                # EXR write expects BGR or RGB float32
                 write_exr(filepath, result_out)
             else:
-                # OpenCV expects BGR
                 if len(result_out.shape) == 3 and result_out.shape[2] >= 3:
-                    result_out = result_out[:, :, ::-1]  # RGB -> BGR
+                    result_out = result_out[:, :, ::-1]
                 cv2.imwrite(filepath, result_out)
 
             self.status_label.setText(f"Saved: {os.path.basename(filepath)}")
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save image:\n{str(e)}")
+
+    def _on_render_sequence(self):
+        if not self.is_sequence_mode or not self.sequence_paths:
+            QMessageBox.warning(self, "Warning", "No sequence loaded.")
+            return
+
+        ws = self.window_size_spin.value()
+        th = self.threshold_spin.value()
+
+        # Determine output directory
+        output_dir = self.render_dir_edit.text().strip()
+        if not output_dir:
+            # Default: create a subfolder next to source
+            assert self.sequence_dir is not None
+            output_dir = os.path.join(self.sequence_dir, "..", os.path.basename(self.sequence_dir) + "_processed")
+            output_dir = os.path.abspath(output_dir)
+
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to create output directory:\n{str(e)}")
+            return
+
+        # Confirm
+        reply = QMessageBox.question(
+            self, "Render Sequence",
+            f"Render {len(self.sequence_paths)} frames?\n\n"
+            f"Parameters: ws={ws}, th={th}\n"
+            f"Output: {output_dir}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Disable controls during render
+        self._set_sequence_controls_enabled(False)
+        self.btn_process.setEnabled(False)
+        self.btn_save.setEnabled(False)
+        self.btn_render.setEnabled(False)
+        self.render_progress.setVisible(True)
+        self.render_progress.setMaximum(len(self.sequence_paths))
+        self.render_progress.setValue(0)
+        self.status_label.setText("Rendering sequence...")
+
+        # Start worker thread
+        self.render_worker = RenderWorker(
+            self.sequence_paths, output_dir, ws, th, self.original_dtype
+        )
+        self.render_worker.progress.connect(self._on_render_progress)
+        self.render_worker.frame_done.connect(self._on_render_frame_done)
+        self.render_worker.finished.connect(self._on_render_finished)
+        self.render_worker.error.connect(self._on_render_error)
+        self.render_worker.start()
+
+    def _on_render_progress(self, frame_index, filename):
+        self.status_label.setText(f"Rendering: {filename} ({frame_index + 1}/{len(self.sequence_paths)})")
+
+    def _on_render_frame_done(self, done, total):
+        self.render_progress.setValue(done)
+
+    def _on_render_finished(self):
+        self.render_progress.setValue(len(self.sequence_paths))
+        self.status_label.setText(f"Render complete — {len(self.sequence_paths)} frames processed")
+
+        # Re-enable controls
+        self._set_sequence_controls_enabled(True)
+        self.btn_process.setEnabled(True)
+        self.btn_render.setEnabled(True)
+
+        QMessageBox.information(
+            self, "Render Complete",
+            f"Successfully processed {len(self.sequence_paths)} frames."
+        )
+
+    def _on_render_error(self, msg):
+        self.status_label.setText(f"Render error: {msg}")
 
     def _on_preset_selected(self, item):
         name = item.text()
@@ -728,9 +1087,9 @@ class FireflyZapperGUI(QMainWindow):
         reply = QMessageBox.question(
             self, "Delete Preset",
             f"Delete preset '{name}'?",
-            QMessageBox.Yes | QMessageBox.No
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-        if reply == QMessageBox.Yes:
+        if reply == QMessageBox.StandardButton.Yes:
             self.preset_manager.delete(name)
             self._refresh_preset_list()
             self.status_label.setText(f"Deleted preset: {name}")
