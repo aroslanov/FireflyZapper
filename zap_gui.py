@@ -106,7 +106,12 @@ def process_channel_with_mask(channel, window_size, threshold):
     z_scores = np.abs((channel_float - mean) / std)
     is_firefly = z_scores > threshold
 
-    median_filtered = cv2.medianBlur(channel_float, window_size)
+    # medianBlur only supports uint8, so implement a float32-compatible median filter
+    half = window_size // 2
+    padded = np.pad(channel_float, half, mode='reflect')
+    windows = np.lib.stride_tricks.sliding_window_view(padded, (window_size, window_size))
+    median_filtered = np.median(windows, axis=(-2, -1))
+
     result = np.where(is_firefly, median_filtered, channel_float)
     return result, is_firefly
 

@@ -93,7 +93,13 @@ def process_channel(channel, window_size, threshold):
     z_scores = np.abs((channel_float - mean) / std)
     is_firefly = z_scores > threshold
 
-    median_filtered = cv2.medianBlur(channel.astype(np.float32), window_size)
+    # medianBlur only supports uint8, so implement a float32-compatible median filter
+    # using numpy sliding_window_view (available in numpy 1.20+)
+    half = window_size // 2
+    padded = np.pad(channel_float, half, mode='reflect')
+    windows = np.lib.stride_tricks.sliding_window_view(padded, (window_size, window_size))
+    median_filtered = np.median(windows, axis=(-2, -1))
+
     result = np.where(is_firefly, median_filtered, channel_float)
     return result
 
