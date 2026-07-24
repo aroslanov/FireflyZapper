@@ -118,14 +118,16 @@ def process_channel_with_mask(channel, window_size, threshold):
     return result, is_firefly
 
 
-def array_to_qpixmap(arr, normalize=True):
-    """Convert a numpy array (float32, [0,1]) to QPixmap."""
+def array_to_qpixmap(arr, gamma=1.0):
+    """Convert a numpy array (float32, [0,1]) to QPixmap with optional gamma correction."""
     if arr.dtype != np.uint8:
-        if normalize:
-            if arr.max() > arr.min():
-                arr = (arr - arr.min()) / (arr.max() - arr.min())
-            else:
-                arr = np.zeros_like(arr)
+        if arr.max() > arr.min():
+            arr = (arr - arr.min()) / (arr.max() - arr.min())
+        else:
+            arr = np.zeros_like(arr)
+        # Apply gamma correction for display
+        if gamma != 1.0:
+            arr = np.power(np.clip(arr, 0, 1), gamma)
         arr = (np.clip(arr, 0, 1) * 255).astype(np.uint8)
 
     h, w = arr.shape[:2]
@@ -353,6 +355,7 @@ class ZoomableImagePreview(QWidget):
         self._pixmap = None
         self._drag_start = None
         self._zoom_state = zoom_state
+        self._gamma = 1.0
 
         self.setMinimumSize(200, 150)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -362,10 +365,11 @@ class ZoomableImagePreview(QWidget):
         if self._zoom_state:
             self._zoom_state.changed.connect(self.update)
 
-    def set_image(self, arr):
+    def set_image(self, arr, gamma=1.0):
         """Set the image from a numpy array."""
         self._image_arr = arr
-        pm = array_to_qpixmap(arr)
+        self._gamma = gamma
+        pm = array_to_qpixmap(arr, gamma=gamma)
         self._pixmap = pm
         if self._zoom_state and arr is not None:
             h, w = arr.shape[:2]
@@ -374,6 +378,14 @@ class ZoomableImagePreview(QWidget):
             if old_size is None or old_size != (w, h):
                 self._zoom_state.set_image_size(w, h)
                 self._zoom_state.zoom_fit(self.width(), self.height())
+        self.update()
+
+    def set_gamma(self, gamma):
+        """Re-render the pixmap with a new gamma value (without reloading)."""
+        if self._image_arr is None:
+            return
+        self._gamma = gamma
+        self._pixmap = array_to_qpixmap(self._image_arr, gamma=gamma)
         self.update()
 
     def clear(self):
@@ -943,6 +955,26 @@ class FireflyZapperGUI(QMainWindow):
         )
         gl.addWidget(self.threshold_slider, 1, 2)
 
+        # Gamma (display only)
+        gl.addWidget(QLabel("Display Gamma:"), 2, 0)
+        self.gamma_spin = QDoubleSpinBox()
+        self.gamma_spin.setRange(0.1, 5.0)
+        self.gamma_spin.setValue(1.0)
+        self.gamma_spin.setSingleStep(0.1)
+        self.gamma_spin.valueChanged.connect(self._on_gamma_changed)
+        gl.addWidget(self.gamma_spin, 2, 1)
+
+        self.gamma_slider = QSlider(Qt.Orientation.Horizontal)
+        self.gamma_slider.setRange(10, 500)
+        self.gamma_slider.setValue(100)
+        self.gamma_slider.valueChanged.connect(
+            lambda v: self.gamma_spin.setValue(v / 100.0)
+        )
+        self.gamma_spin.valueChanged.connect(
+            lambda v: self.gamma_slider.setValue(int(v * 100))
+        )
+        gl.addWidget(self.gamma_slider, 2, 2)
+
         layout.addWidget(group)
 
     def _build_preset_section(self, layout):
@@ -1043,8 +1075,9 @@ class FireflyZapperGUI(QMainWindow):
             self.original_image, self.original_dtype = load_image(fpath)
             self.file_label.setText(f"[Sequence] {os.path.basename(os.path.dirname(fpath))}")
 
-            self.preview_original.set_image(self.original_image)
-            self.preview_original_only.set_image(self.original_image)
+            gamma = self.gamma_spin.value()
+            self.preview_original.set_image(self.original_image, gamma)
+            self.preview_original_only.set_image(self.original_image, gamma)
 
             self.processed_image = None
             self.artifacts_mask = None
@@ -1098,8 +1131,9 @@ class FireflyZapperGUI(QMainWindow):
                 f"Loaded: {os.path.basename(filepath)} ({self.original_image.shape[1]}×{self.original_image.shape[0]})"
             )
 
-            self.preview_original.set_image(self.original_image)
-            self.preview_original_only.set_image(self.original_image)
+            gamma = self.gamma_spin.value()
+            self.preview_original.set_image(self.original_image, gamma)
+            self.preview_original_only.set_image(self.original_image, gamma)
 
             self.processed_image = None
             self.artifacts_mask = None
@@ -1179,6 +1213,14 @@ class FireflyZapperGUI(QMainWindow):
                 self._debounce_timer.timeout.connect(self._on_process)
             self._debounce_timer.start(300)
 
+    def _on_gamma_changed(self):
+        """Refresh all previews with the new display gamma."""
+        gamma = self.gamma_spin.value()
+        for preview in [self.preview_original, self.preview_processed,
+                        self.preview_original_only, self.preview_processed_only,
+                        self.preview_mask]:
+            preview.set_gamma(gamma)
+
     def _on_process(self):
         if self.original_image is None:
             QMessageBox.warning(self, "Warning", "Please open an image or sequence first.")
@@ -1195,12 +1237,13 @@ class FireflyZapperGUI(QMainWindow):
             self.processed_image = result
             self.artifacts_mask = mask
 
-            self.preview_processed.set_image(result)
-            self.preview_processed_only.set_image(result)
+            gamma = self.gamma_spin.value()
+            self.preview_processed.set_image(result, gamma)
+            self.preview_processed_only.set_image(result, gamma)
 
             blended = self.original_image.copy()
             blended[mask] = blended[mask] * 0.4 + np.array([1.0, 0.0, 0.0]) * 0.6
-            self.preview_mask.set_image(blended)
+            self.preview_mask.set_image(blended, gamma)
 
             num_fireflies = int(np.sum(mask))
             total_pixels = mask.size
