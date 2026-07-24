@@ -1,8 +1,10 @@
-# Firefly Removal Script
+# FireflyZapper
+
+[![GUI Screenshot](assets/screenshot.png)](assets/screenshot.png)
 
 ## Overview
 
-This repository contains a Python script (`zap.py`) designed to remove fireflies (hot pixels or bright spots) from images. The script utilizes local statistics and z-score thresholding to identify and replace firefly pixels with median-filtered values, effectively cleaning up the image.
+FireflyZapper removes fireflies (hot pixels, bright spots, or specular artifacts) from images using local statistics and z-score thresholding. It comes with both a **graphical user interface (GUI)** and a **command-line interface (CLI)**.
 
 ## Features
 
@@ -10,34 +12,76 @@ This repository contains a Python script (`zap.py`) designed to remove fireflies
 - **Z-Score Thresholding**: Identifies fireflies based on a customizable z-score threshold.
 - **Median Filtering**: Replaces detected firefly pixels with median-filtered values from their neighborhood.
 - **Supports Grayscale, Color Images, and EXR Format**: Processes each color channel separately to handle color images effectively. Additionally, it supports high dynamic range (HDR) images in the EXR format.
+- **Graphical User Interface** (`zap_gui.py`): PySide6-based GUI with interactive previews, zoom/pan, preset management, and sequence processing.
+- **Sequence Processing**: Load an entire folder of images, scrub through frames, and batch-render the whole sequence.
+- **Preset Management**: Save/load/delete parameter presets for quick switching between configurations.
 
 ## Installation
 
-To use the `zap.py` script, you need Python installed on your system along with the required libraries. You can install these dependencies using pip:
+### Requirements
+
+- Python 3.8+
+- Dependencies listed in `requirements.txt`
+
+### Setup
 
 ```bash
-pip install numpy opencv-python openexr
-```
+# Clone the repository
+git clone https://github.com/aroslanov/FireflyZapper.git
+cd FireflyZapper
 
-Alternatively, you can create a virtual environment and install the dependencies there to avoid conflicts:
+# Create a virtual environment (recommended)
+python -m venv .venv
 
-```bash
-# Create a virtual environment
-python -m venv firefly-removal-env
-
-# Activate the virtual environment (Linux/Mac)
-source firefly-removal-env/bin/activate
-
-# Activate the virtual environment (Windows)
-firefly-removal-env\Scripts\activate
+# Activate it
+# Windows:
+.venv\Scripts\activate
+# Linux/Mac:
+source .venv/bin/activate
 
 # Install dependencies
-pip install numpy opencv-python openexr
+pip install -r requirements.txt
 ```
 
-## Usage
+## GUI Usage
 
-The script can be run from the command line with the following syntax:
+Launch the GUI with:
+
+```bash
+python zap_gui.py
+```
+
+### Interface Overview
+
+The GUI is organized into a left control panel and a right preview area with four tabs:
+
+| Tab | Description |
+|-----|-------------|
+| **Compare** | Side-by-side view of original and processed images with synced zoom/pan |
+| **Artifacts Mask** | Shows detected fireflies overlaid in red on the original image |
+| **Original** | Full-size view of the original image (zoomable) |
+| **Processed** | Full-size view of the processed result (zoomable) |
+
+### Controls
+
+- **Input**: Open a single image or an entire sequence folder.
+- **Sequence Controls**: Frame slider, navigation buttons (First/Prev/Next/Last), output directory picker, and render progress bar.
+- **Parameters**: Adjust window size (3–31) and threshold (0.5–20.0) via sliders or spin boxes.
+- **Presets**: Save current parameters as named presets, or use quick presets (Mild / Medium / Aggressive / Very Aggressive).
+- **Actions**: Auto-preview on parameter change, process current frame, save result, or render the full sequence.
+- **Zoom**: Use the zoom toolbar (Fit / 1:1 / + / -) or scroll-wheel to zoom, click-and-drag to pan.
+
+### Sequence Rendering
+
+1. Click **Open Sequence** and select a folder containing images.
+2. Scrub through frames using the slider or navigation buttons.
+3. Adjust parameters — changes auto-preview on the current frame.
+4. Optionally set a custom output directory, or leave blank to create a `_processed` folder next to the source.
+5. Click **Render Sequence** to batch-process all frames in a background thread.
+
+## CLI Usage
+
+The CLI script can be run from the command line with the following syntax:
 
 ```bash
 python zap.py <input> <output> [--window_size <size>] [--threshold <value>]
@@ -57,27 +101,18 @@ python zap.py <input> <output> [--window_size <size>] [--threshold <value>]
 
 - `--threshold <value>`: (Optional) The z-score threshold for firefly detection. Pixels with z-scores above this value are considered fireflies and will be replaced (default is 3.0).
 
-### Example
-
-To remove fireflies from an image named `input.jpg` and save the result as `output.png`, you can run:
+### CLI Examples
 
 ```bash
+# Process a single image
 python zap.py input.jpg output.png --window_size 7 --threshold 2.5
-```
 
-To process all images in a directory named `images` and save the results in a new directory named `processed_images`, you can run:
-
-```bash
+# Process all images in a directory
 python zap.py images processed_images --window_size 9 --threshold 3.5
-```
 
-If you want to add a prefix `clean_` to each output file name, you can run:
-
-```bash
+# Add a prefix to output filenames
 python zap.py images images --prefix clean_
 ```
-
-This will process all supported images in the `images` directory and save them back into the same directory with the prefix `clean_`.
 
 ## How It Works
 
