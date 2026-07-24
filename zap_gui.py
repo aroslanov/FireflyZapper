@@ -550,6 +550,8 @@ class FireflyZapperGUI(QMainWindow):
         self.processed_image = None
         self.artifacts_mask = None
         self._exr_compression = None
+        self._last_image_dir = ""
+        self._last_sequence_dir = ""
 
         # ── Sequence state ──
         self.sequence_paths = []       # list of full file paths
@@ -1120,11 +1122,13 @@ class FireflyZapperGUI(QMainWindow):
 
     def _on_open_image(self):
         filepath, _ = QFileDialog.getOpenFileName(
-            self, "Open Image", "",
+            self, "Open Image", self._last_image_dir,
             "Images (*.exr *.jpg *.jpeg *.png *.bmp);;All Files (*)"
         )
         if not filepath:
             return
+
+        self._last_image_dir = os.path.dirname(filepath)
 
         # Switch to single image mode
         self.is_sequence_mode = False
@@ -1162,10 +1166,12 @@ class FireflyZapperGUI(QMainWindow):
 
     def _on_open_sequence(self):
         directory = QFileDialog.getExistingDirectory(
-            self, "Open Image Sequence Folder", ""
+            self, "Open Image Sequence Folder", self._last_sequence_dir
         )
         if not directory:
             return
+
+        self._last_sequence_dir = directory
 
         files = scan_sequence(directory)
         if not files:
