@@ -570,7 +570,7 @@ class FireflyZapperGUI(QMainWindow):
         self.preview_tabs = QTabWidget()
         right_layout.addWidget(self.preview_tabs)
 
-        # Tab 1: Side-by-side (zoomable)
+        # Tab 1: Side-by-side (zoomable, synced)
         self.tab_compare = QWidget()
         compare_vlayout = QVBoxLayout(self.tab_compare)
         compare_vlayout.setContentsMargins(0, 0, 0, 0)
@@ -614,25 +614,16 @@ class FireflyZapperGUI(QMainWindow):
         compare_vlayout.addLayout(compare_hlayout)
         self.preview_tabs.addTab(self.tab_compare, "Compare")
 
-        # Tab 2: Artifacts mask
-        self.tab_mask = QWidget()
-        mask_layout = QVBoxLayout(self.tab_mask)
-        self.preview_mask = ImagePreview("Artifacts Mask")
-        mask_layout.addWidget(self.preview_mask)
+        # Tab 2: Artifacts mask (zoomable, independent)
+        self.tab_mask, self.preview_mask, _ = self._build_zoomable_tab("Artifacts Mask")
         self.preview_tabs.addTab(self.tab_mask, "Artifacts Mask")
 
-        # Tab 3: Original only
-        self.tab_original = QWidget()
-        orig_layout = QVBoxLayout(self.tab_original)
-        self.preview_original_only = ImagePreview("Original")
-        orig_layout.addWidget(self.preview_original_only)
+        # Tab 3: Original only (zoomable, independent)
+        self.tab_original, self.preview_original_only, _ = self._build_zoomable_tab("Original")
         self.preview_tabs.addTab(self.tab_original, "Original")
 
-        # Tab 4: Processed only
-        self.tab_processed_only = QWidget()
-        proc_layout = QVBoxLayout(self.tab_processed_only)
-        self.preview_processed_only = ImagePreview("Processed")
-        proc_layout.addWidget(self.preview_processed_only)
+        # Tab 4: Processed only (zoomable, independent)
+        self.tab_processed_only, self.preview_processed_only, _ = self._build_zoomable_tab("Processed")
         self.preview_tabs.addTab(self.tab_processed_only, "Processed")
 
         # Status bar
@@ -784,6 +775,48 @@ class FireflyZapperGUI(QMainWindow):
                 border-radius: 3px;
             }
         """)
+
+    def _build_zoomable_tab(self, title):
+        """Build a tab with a zoom toolbar and a single ZoomableImagePreview.
+        Returns (tab_widget, preview_widget, zoom_state)."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        # Zoom toolbar
+        toolbar = QHBoxLayout()
+        toolbar.setContentsMargins(4, 4, 4, 0)
+        zoom_label = QLabel("Zoom: 100%")
+        zoom_label.setStyleSheet("color: #aaa; font-size: 12px;")
+        toolbar.addWidget(zoom_label)
+        toolbar.addStretch()
+        btn_fit = QPushButton("Fit")
+        btn_fit.setFixedHeight(24)
+        toolbar.addWidget(btn_fit)
+        btn_100 = QPushButton("1:1")
+        btn_100.setFixedHeight(24)
+        toolbar.addWidget(btn_100)
+        btn_in = QPushButton("+")
+        btn_in.setFixedSize(28, 24)
+        toolbar.addWidget(btn_in)
+        btn_out = QPushButton("−")
+        btn_out.setFixedSize(28, 24)
+        toolbar.addWidget(btn_out)
+        layout.addLayout(toolbar)
+
+        zs = ZoomState()
+        zs.changed.connect(lambda: zoom_label.setText(f"Zoom: {zs.zoom * 100:.0f}%"))
+        def _fit():
+            zs.zoom_fit(preview.width(), preview.height())
+        btn_fit.clicked.connect(_fit)
+        btn_100.clicked.connect(zs.zoom_100)
+        btn_in.clicked.connect(zs.zoom_in)
+        btn_out.clicked.connect(zs.zoom_out)
+
+        preview = ZoomableImagePreview(title, zoom_state=zs)
+        layout.addWidget(preview)
+        return tab, preview, zs
 
     def _build_file_section(self, layout):
         group = QGroupBox("Input")
