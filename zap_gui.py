@@ -20,8 +20,8 @@ from PySide6.QtWidgets import (
     QScrollArea, QFrame, QSizePolicy, QComboBox, QCheckBox,
     QProgressBar, QProgressDialog
 )
-from PySide6.QtCore import Qt, QTimer, Signal, Slot, QByteArray, QBuffer, QThread
-from PySide6.QtGui import QPixmap, QImage, QFont
+from PySide6.QtCore import Qt, QTimer, Signal, Slot, QByteArray, QBuffer, QThread, QRectF, QObject
+from PySide6.QtGui import QPixmap, QImage, QFont, QPainter, QColor
 
 # Import firefly processing from zap.py
 from zap import process_channel, read_exr, write_exr, SUPPORTED_EXTENSIONS
@@ -270,10 +270,201 @@ class RenderWorker(QThread):
 
 
 # ──────────────────────────────────────────────
-# Image Preview Widget
+# Image Preview Widgets
 # ──────────────────────────────────────────────
+
+class ZoomState(QObject):
+    """Shared zoom/pan state synced between compare panels."""
+    changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.zoom = 1.0
+        self.offset_x = 0.0
+        self.offset_y = 0.0
+        self.image_size = None  # (w, h) of the source image
+
+    def set_image_size(self, w, h):
+        self.image_size = (w, h)
+        self._clamp_offset()
+
+    def reset(self):
+        self.zoom = 1.0
+        self.offset_x = 0.0
+        self.offset_y = 0.0
+        self.changed.emit()
+
+    def zoom_in(self, factor=1.25):
+        self._apply_zoom(self.zoom * factor)
+
+    def zoom_out(self, factor=1.25):
+        self._apply_zoom(self.zoom / factor)
+
+    def zoom_fit(self, view_w, view_h):
+        """Set zoom so the image fits in the given view size."""
+        if self.image_size is None:
+            return
+        iw, ih = self.image_size
+        if iw == 0 or ih == 0:
+            return
+        self.zoom = min(view_w / iw, view_h / ih)
+        self.offset_x = 0.0
+        self.offset_y = 0.0
+        self.changed.emit()
+
+    def zoom_100(self):
+        self.zoom = 1.0
+        self.offset_x = 0.0
+        self.offset_y = 0.0
+        self.changed.emit()
+
+    def pan_by(self, dx, dy):
+        self.offset_x += dx
+        self.offset_y += dy
+        self._clamp_offset()
+        self.changed.emit()
+
+    def _apply_zoom(self, new_zoom):
+        new_zoom = max(0.1, min(new_zoom, 50.0))
+        self.zoom = new_zoom
+        self._clamp_offset()
+        self.changed.emit()
+
+    def _clamp_offset(self):
+        if self.image_size is None:
+            return
+        iw, ih = self.image_size
+        sw = iw * self.zoom
+        sh = ih * self.zoom
+        # Allow some over-pan (20% of the visible area)
+        margin_w = sw * 0.2
+        margin_h = sh * 0.2
+        self.offset_x = max(-margin_w, min(self.offset_x, sw - margin_w))
+        self.offset_y = max(-margin_h, min(self.offset_y, sh - margin_h))
+
+
+class ZoomableImagePreview(QWidget):
+    """A widget that displays an image with zoom/pan support via shared ZoomState."""
+
+    def __init__(self, title="", zoom_state=None, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self._image_arr = None
+        self._pixmap = None
+        self._drag_start = None
+        self._zoom_state = zoom_state
+
+        self.setMinimumSize(200, 150)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMouseTracking(False)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+        if self._zoom_state:
+            self._zoom_state.changed.connect(self.update)
+
+    def set_image(self, arr):
+        """Set the image from a numpy array."""
+        self._image_arr = arr
+        pm = array_to_qpixmap(arr)
+        self._pixmap = pm
+        if self._zoom_state and arr is not None:
+            h, w = arr.shape[:2]
+            self._zoom_state.set_image_size(w, h)
+            self._zoom_state.zoom_fit(self.width(), self.height())
+        self.update()
+
+    def clear(self):
+        self._image_arr = None
+        self._pixmap = None
+        self.update()
+
+    def paintEvent(self, event):
+        if self._pixmap is None or self._zoom_state is None:
+            # Draw placeholder
+            painter = QPainter(self)
+            painter.fillRect(self.rect(), QColor("#1e1e1e"))
+            painter.setPen(QColor("#888"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, f"{self.title}\n(no image)")
+            painter.end()
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.fillRect(self.rect(), QColor("#1e1e1e"))
+
+        zs = self._zoom_state
+        iw, ih = zs.image_size
+        sw = iw * zs.zoom
+        sh = ih * zs.zoom
+
+        # Center the image in the view, then apply offset
+        cx = (self.width() - sw) / 2.0 + zs.offset_x
+        cy = (self.height() - sh) / 2.0 + zs.offset_y
+
+        target_rect = QRectF(cx, cy, sw, sh)
+        painter.drawPixmap(target_rect, self._pixmap, self._pixmap.rect())
+
+        # Draw border
+        painter.setPen(QColor("#444"))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+
+        painter.end()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._zoom_state and self._pixmap is not None:
+            self._zoom_state.zoom_fit(self.width(), self.height())
+
+    def wheelEvent(self, event):
+        if self._zoom_state is None or self._pixmap is None:
+            return
+        # Zoom toward cursor position
+        old_zoom = self._zoom_state.zoom
+        if event.angleDelta().y() > 0:
+            self._zoom_state.zoom_in()
+        else:
+            self._zoom_state.zoom_out()
+        new_zoom = self._zoom_state.zoom
+
+        # Adjust offset so the point under the cursor stays fixed
+        factor = new_zoom / old_zoom
+        mx = event.position().x()
+        my = event.position().y()
+        iw, ih = self._zoom_state.image_size
+        cx = (self.width() - iw * old_zoom) / 2.0 + self._zoom_state.offset_x
+        cy = (self.height() - ih * old_zoom) / 2.0 + self._zoom_state.offset_y
+        # Relative position of cursor within the image
+        rx = (mx - cx) / (iw * old_zoom)
+        ry = (my - cy) / (ih * old_zoom)
+        # New center
+        new_cx = mx - rx * iw * new_zoom
+        new_cy = my - ry * ih * new_zoom
+        self._zoom_state.offset_x = new_cx - (self.width() - iw * new_zoom) / 2.0
+        self._zoom_state.offset_y = new_cy - (self.height() - ih * new_zoom) / 2.0
+        self._zoom_state._clamp_offset()
+        self._zoom_state.changed.emit()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._pixmap is not None:
+            self._drag_start = event.position()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_start is not None and self._zoom_state:
+            dx = event.position().x() - self._drag_start.x()
+            dy = event.position().y() - self._drag_start.y()
+            self._zoom_state.pan_by(dx, dy)
+            self._drag_start = event.position()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start = None
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+
 class ImagePreview(QLabel):
-    """A label that displays an image scaled to fit, preserving aspect ratio."""
+    """A label that displays an image scaled to fit, preserving aspect ratio.
+    Used for non-interactive previews (mask, original-only, processed-only tabs)."""
     def __init__(self, title="", parent=None):
         super().__init__(parent)
         self.title = title
@@ -299,6 +490,12 @@ class ImagePreview(QLabel):
         pm = array_to_qpixmap(arr)
         self._pixmap = pm
         self._update_display()
+
+    def clear(self):
+        self._image_arr = None
+        self._pixmap = None
+        self.setPixmap(QPixmap())
+        self.setText(f"{self.title}\n(no image)")
 
     def _update_display(self):
         if self._pixmap is None:
@@ -370,13 +567,48 @@ class FireflyZapperGUI(QMainWindow):
         self.preview_tabs = QTabWidget()
         right_layout.addWidget(self.preview_tabs)
 
-        # Tab 1: Side-by-side
+        # Tab 1: Side-by-side (zoomable)
         self.tab_compare = QWidget()
-        compare_layout = QHBoxLayout(self.tab_compare)
-        self.preview_original = ImagePreview("Original")
-        self.preview_processed = ImagePreview("Processed")
-        compare_layout.addWidget(self.preview_original)
-        compare_layout.addWidget(self.preview_processed)
+        compare_vlayout = QVBoxLayout(self.tab_compare)
+        compare_vlayout.setContentsMargins(0, 0, 0, 0)
+        compare_vlayout.setSpacing(4)
+
+        # Zoom toolbar
+        zoom_toolbar = QHBoxLayout()
+        zoom_toolbar.setContentsMargins(4, 4, 4, 0)
+        self.zoom_label = QLabel("Zoom: 100%")
+        self.zoom_label.setStyleSheet("color: #aaa; font-size: 12px;")
+        zoom_toolbar.addWidget(self.zoom_label)
+        zoom_toolbar.addStretch()
+        btn_zoom_fit = QPushButton("Fit")
+        btn_zoom_fit.setFixedHeight(24)
+        btn_zoom_fit.clicked.connect(self._on_zoom_fit)
+        zoom_toolbar.addWidget(btn_zoom_fit)
+        btn_zoom_100 = QPushButton("1:1")
+        btn_zoom_100.setFixedHeight(24)
+        btn_zoom_100.clicked.connect(self._on_zoom_100)
+        zoom_toolbar.addWidget(btn_zoom_100)
+        btn_zoom_in = QPushButton("+")
+        btn_zoom_in.setFixedSize(28, 24)
+        btn_zoom_in.clicked.connect(self._on_zoom_in)
+        zoom_toolbar.addWidget(btn_zoom_in)
+        btn_zoom_out = QPushButton("−")
+        btn_zoom_out.setFixedSize(28, 24)
+        btn_zoom_out.clicked.connect(self._on_zoom_out)
+        zoom_toolbar.addWidget(btn_zoom_out)
+        compare_vlayout.addLayout(zoom_toolbar)
+
+        # Shared zoom state
+        self._zoom_state = ZoomState()
+        self._zoom_state.changed.connect(self._on_zoom_changed)
+
+        # Side-by-side previews
+        compare_hlayout = QHBoxLayout()
+        self.preview_original = ZoomableImagePreview("Original", zoom_state=self._zoom_state)
+        self.preview_processed = ZoomableImagePreview("Processed", zoom_state=self._zoom_state)
+        compare_hlayout.addWidget(self.preview_original)
+        compare_hlayout.addWidget(self.preview_processed)
+        compare_vlayout.addLayout(compare_hlayout)
         self.preview_tabs.addTab(self.tab_compare, "Compare")
 
         # Tab 2: Artifacts mask
@@ -1113,6 +1345,28 @@ class FireflyZapperGUI(QMainWindow):
         self.preset_list.clear()
         for name in self.preset_manager.list_names():
             self.preset_list.addItem(name)
+
+    # ── Zoom handlers ──
+
+    def _on_zoom_changed(self):
+        zs = self._zoom_state
+        self.zoom_label.setText(f"Zoom: {zs.zoom * 100:.0f}%")
+
+    def _on_zoom_fit(self):
+        if self._zoom_state and self.preview_original._pixmap is not None:
+            self._zoom_state.zoom_fit(self.preview_original.width(), self.preview_original.height())
+
+    def _on_zoom_100(self):
+        if self._zoom_state:
+            self._zoom_state.zoom_100()
+
+    def _on_zoom_in(self):
+        if self._zoom_state:
+            self._zoom_state.zoom_in()
+
+    def _on_zoom_out(self):
+        if self._zoom_state:
+            self._zoom_state.zoom_out()
 
 
 # ──────────────────────────────────────────────
