@@ -369,8 +369,11 @@ class ZoomableImagePreview(QWidget):
         self._pixmap = pm
         if self._zoom_state and arr is not None:
             h, w = arr.shape[:2]
-            self._zoom_state.set_image_size(w, h)
-            self._zoom_state.zoom_fit(self.width(), self.height())
+            old_size = self._zoom_state.image_size
+            # Only reset zoom if the image dimensions changed (new image load)
+            if old_size is None or old_size != (w, h):
+                self._zoom_state.set_image_size(w, h)
+                self._zoom_state.zoom_fit(self.width(), self.height())
         self.update()
 
     def clear(self):
