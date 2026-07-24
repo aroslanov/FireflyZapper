@@ -12,13 +12,14 @@ THRESHOLD_DEFAULT = 3.0
 
 def read_exr(filename):
     """
-    Reads an EXR file and returns a NumPy array containing the image data.
+    Reads an EXR file and returns a NumPy array containing the image data
+    and the compression type used in the original file.
 
     Args:
         filename (str): Path to the EXR file.
 
     Returns:
-        np.ndarray: A NumPy array representing the image in RGB format.
+        tuple: (np.ndarray, Imath.Compression) — RGB image and its compression.
     """
     exr_file = OpenEXR.InputFile(filename)
     header = exr_file.header()
@@ -27,20 +28,24 @@ def read_exr(filename):
     width = data_window.max.x - data_window.min.x + 1
     height = data_window.max.y - data_window.min.y + 1
 
+    compression = header.get('compression', Imath.Compression(Imath.Compression.ZIPS_COMPRESSION))
+
     FLOAT = Imath.PixelType(Imath.PixelType.FLOAT)
     red = np.frombuffer(exr_file.channel('R', FLOAT), dtype=np.float32).reshape(height, width)
     green = np.frombuffer(exr_file.channel('G', FLOAT), dtype=np.float32).reshape(height, width)
     blue = np.frombuffer(exr_file.channel('B', FLOAT), dtype=np.float32).reshape(height, width)
 
-    return np.dstack((red, green, blue))
+    return np.dstack((red, green, blue)), compression
 
-def write_exr(filename, data):
+def write_exr(filename, data, compression=None):
     """
     Writes a NumPy array to an EXR file.
 
     Args:
         filename (str): Path to the output EXR file.
         data (np.ndarray): A NumPy array representing the image in RGB format.
+        compression (Imath.Compression, optional): Compression type to use.
+            If None, defaults to ZIPS compression.
     """
     data = data.astype(np.float32)
     if len(data.shape) == 2:
@@ -55,6 +60,9 @@ def write_exr(filename, data):
                                      Imath.V2i(data.shape[1] - 1, data.shape[0] - 1))
     header['displayWindow'] = header['dataWindow']
     
+    if compression is not None:
+        header['compression'] = compression
+
     FLOAT = Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
     header['channels'] = dict([(c, FLOAT) for c in "RGB"])
     
@@ -114,10 +122,11 @@ def process_image(input_path, output_path, window_size, threshold):
         threshold (float): Z-score threshold for detecting fireflies.
     """
     if input_path.endswith('.exr'):
-        image = read_exr(input_path)
+        image, compression = read_exr(input_path)
         original_dtype = np.float32
     else:
         image = cv2.imread(input_path, cv2.IMREAD_UNCHANGED)
+        compression = None
         if image is None:
             raise ValueError(f"Failed to read image: {input_path}")
 
@@ -149,7 +158,7 @@ def process_image(input_path, output_path, window_size, threshold):
 
     try:
         if output_path.endswith('.exr'):
-            write_exr(output_path, result)
+            write_exr(output_path, result, compression)
         else:
             cv2.imwrite(output_path, result)
     except Exception as e:

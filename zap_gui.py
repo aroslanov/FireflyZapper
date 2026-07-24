@@ -43,12 +43,15 @@ PREVIEW_MAX_SIZE = 600
 # Image processing helpers
 # ──────────────────────────────────────────────
 def load_image(filepath):
-    """Load an image from disk, normalizing to float32 [0,1] RGB."""
+    """Load an image from disk, normalizing to float32 [0,1] RGB.
+    Returns (image, original_dtype, compression) where compression is
+    an Imath.Compression for EXR files or None for other formats."""
     if filepath.lower().endswith('.exr'):
-        image = read_exr(filepath)
+        image, compression = read_exr(filepath)
         original_dtype = np.float32
     else:
         image = cv2.imread(filepath, cv2.IMREAD_UNCHANGED)
+        compression = None
         if image is None:
             raise ValueError(f"Failed to read image: {filepath}")
         if image.dtype == np.uint16:
@@ -65,7 +68,7 @@ def load_image(filepath):
         if len(image.shape) == 3 and image.shape[2] >= 3:
             image = image[:, :, ::-1]
 
-    return image, original_dtype
+    return image, original_dtype, compression
 
 
 def process_image_full(image, window_size, threshold):
@@ -239,7 +242,7 @@ class RenderWorker(QThread):
             self.progress.emit(i, basename)
 
             try:
-                image, _ = load_image(fpath)
+                image, _, compression = load_image(fpath)
                 result, _ = process_image_full(image, self.window_size, self.threshold)
 
                 # Convert back to original dtype
@@ -255,7 +258,7 @@ class RenderWorker(QThread):
                 out_path = os.path.join(self.output_dir, out_name)
 
                 if out_path.lower().endswith('.exr'):
-                    write_exr(out_path, result_out)
+                    write_exr(out_path, result_out, compression)
                 else:
                     save_img = result_out
                     if len(save_img.shape) == 3 and save_img.shape[2] >= 3:
@@ -541,6 +544,7 @@ class FireflyZapperGUI(QMainWindow):
         self.original_dtype = None
         self.processed_image = None
         self.artifacts_mask = None
+        self._exr_compression = None
 
         # ── Sequence state ──
         self.sequence_paths = []       # list of full file paths
@@ -1072,7 +1076,7 @@ class FireflyZapperGUI(QMainWindow):
         fpath = self.sequence_paths[self.current_frame_index]
         try:
             self.image_path = fpath
-            self.original_image, self.original_dtype = load_image(fpath)
+            self.original_image, self.original_dtype, self._exr_compression = load_image(fpath)
             self.file_label.setText(f"[Sequence] {os.path.basename(os.path.dirname(fpath))}")
 
             gamma = self.gamma_spin.value()
@@ -1125,7 +1129,7 @@ class FireflyZapperGUI(QMainWindow):
 
         try:
             self.image_path = filepath
-            self.original_image, self.original_dtype = load_image(filepath)
+            self.original_image, self.original_dtype, self._exr_compression = load_image(filepath)
             self.file_label.setText(os.path.basename(filepath))
             self.status_label.setText(
                 f"Loaded: {os.path.basename(filepath)} ({self.original_image.shape[1]}×{self.original_image.shape[0]})"
@@ -1286,7 +1290,8 @@ class FireflyZapperGUI(QMainWindow):
                 result_out = (np.clip(result_out, 0, 1) * 255).astype(np.uint8)
 
             if filepath.lower().endswith('.exr'):
-                write_exr(filepath, result_out)
+                compression = getattr(self, '_exr_compression', None)
+                write_exr(filepath, result_out, compression)
             else:
                 if len(result_out.shape) == 3 and result_out.shape[2] >= 3:
                     result_out = result_out[:, :, ::-1]
