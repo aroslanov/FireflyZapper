@@ -255,17 +255,20 @@ def main():
     parser.add_argument('output', type=str, help='Output directory or image file')
     parser.add_argument('--window_size', type=int, default=WINDOW_SIZE_DEFAULT, help='Window size for local statistics')
     parser.add_argument('--threshold', type=float, default=THRESHOLD_DEFAULT, help='Z-score threshold for firefly detection')
-    parser.add_argument('--use_gpu', type=bool, default=True, nargs='?', const=True, help='Use GPU acceleration if available (CUDA/OpenCL). Falls back to CPU if unavailable.')
-    parser.add_argument('--no_gpu', type=bool, default=False, nargs='?', const=False, help='Force CPU processing even if GPU is available. Useful for debugging or unsupported image types.')
+    gpu_group = parser.add_mutually_exclusive_group()
+    gpu_group.add_argument(
+        '--use-gpu', '--use_gpu', dest='use_gpu', action='store_true',
+        help='Use GPU acceleration if available (the default).'
+    )
+    gpu_group.add_argument(
+        '--no-gpu', '--no_gpu', dest='use_gpu', action='store_false',
+        help='Force CPU processing.'
+    )
+    parser.set_defaults(use_gpu=True)
 
     args = parser.parse_args()
 
-    # Resolve GPU flag — --use_gpu takes precedence over --no-gpu
-    use_gpu_flag = args.use_gpu if args.use_gpu else False
-    if args.no_gpu:
-        use_gpu_flag = False
-    else:
-        use_gpu_flag = True
+    use_gpu_flag = args.use_gpu
 
     # Auto-detect GPU device for status display
     device_label = get_device()

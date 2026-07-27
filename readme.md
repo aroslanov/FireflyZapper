@@ -137,11 +137,13 @@ FireflyZapper supports **multiplatform GPU acceleration** (CUDA via `pycuda`, Op
 ### GPU Detection
 
 The `gpu_backend.py` module auto-detects the available GPU device at runtime:
-- **CUDA**: Detected via `pycuda.driver.init()` — if available, uses `cv2.cuda` or `pycuda` kernels
+- **CUDA**: Detected via `pycuda.driver.init()` — if available, uses a PyCUDA kernel
 - **OpenCL**: Detected via `pyopencl` — if available, uses OpenCL kernels
 - **CPU fallback**: If no GPU is detected, falls back to the original NumPy/CV2 path (always works)
 
-Device detection is cached after the first call via global `_device_label` / `_device_stats` variables, preventing repeated queries. Hot reload is supported via `reload_device_status()` for mid-session GPU plug-in.
+Device detection is cached after the first call via global `_device_label` / `_device_stats` variables, preventing repeated queries. If kernel compilation or execution fails, the backend is disabled for the session, the reason appears in the status text, and processing safely continues on the CPU. Hot reload is supported via `reload_device_status()` for mid-session GPU plug-in.
+
+GPU kernels support odd window sizes through 7×7. Larger windows remain supported and automatically use the CPU implementation.
 
 ### CLI GPU Arguments
 
@@ -166,6 +168,12 @@ The GUI displays a dedicated **GPU status label** showing:
 - CPU blur/median operations take significantly longer
 - GPU acceleration provides 5-20× speedup depending on device
 - Multi-channel RGB processing benefits even more (3 channels × 8.3M pixels)
+
+### Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## Contributing
 

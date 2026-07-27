@@ -24,7 +24,7 @@ from PySide6.QtCore import Qt, QTimer, Signal, Slot, QByteArray, QBuffer, QThrea
 from PySide6.QtGui import QPixmap, QImage, QFont, QPainter, QColor
 
 # Import firefly processing from zap.py — now with GPU acceleration
-from zap import process_channel, read_exr, write_exr, SUPPORTED_EXTENSIONS, process_image_gpu
+from zap import process_channel, read_exr, write_exr, SUPPORTED_EXTENSIONS
 # Import GPU backend for device detection, status display, and GPU-accelerated processing
 from gpu_backend import get_device, get_device_status, is_gpu_active, reload_device_status, process_channel_gpu, process_image_gpu
 
@@ -73,7 +73,7 @@ def load_image(filepath):
     return image, original_dtype, compression
 
 
-def process_image_full(image, window_size, threshold, use_gpu=True):
+def process_image_full(image, window_size, threshold, use_gpu=True, return_mask=True):
     """
     Process an RGB image and return (result, mask).
     mask is a boolean array where True = firefly pixel detected.
@@ -82,41 +82,16 @@ def process_image_full(image, window_size, threshold, use_gpu=True):
     Designed for 4K images (3840×2160) where GPU acceleration provides
     significant speedup over CPU blur/median operations.
     """
-    image_float = image.astype(np.float32)
-
-    # Auto-detect GPU device — cached after first call
+    image_float = np.asarray(image, dtype=np.float32)
     device_label = get_device() if use_gpu else "cpu"
-    if use_gpu and is_gpu_active():
-        # GPU path — dispatch to gpu_backend for channel processing
-        if len(image_float.shape) == 3:
-            channels = cv2.split(image_float)
-            processed_channels = [process_channel_gpu(chan, window_size, threshold, device_label) for chan in channels]
-            result = cv2.merge(processed_channels)
-            # Compute mask on CPU from z-scores (simplification — in production, mask on GPU)
-            mask_channels = []
-            for chan in channels:
-                mask_chan = process_channel_with_mask(chan, window_size, threshold, use_gpu=False)
-                mask_channels.append(mask_chan)
-            mask = np.any(mask_channels, axis=0)
-        else:
-            result = process_channel_gpu(image_float, window_size, threshold, device_label)
-            mask = process_channel_with_mask(image_float, window_size, threshold, use_gpu=False)
-    else:
-        # CPU fallback — original NumPy/CV2 path (always works)
-        if len(image_float.shape) == 3:
-            channels = cv2.split(image_float)
-            processed_channels = []
-            mask_channels = []
-            for chan in channels:
-                result_chan, mask_chan = process_channel_with_mask(chan, window_size, threshold, use_gpu=False)
-                processed_channels.append(result_chan)
-                mask_channels.append(mask_chan)
-            result = cv2.merge(processed_channels)
-            mask = np.any(mask_channels, axis=0)
-        else:
-            result, mask = process_channel_with_mask(image_float, window_size, threshold, use_gpu=False)
-
-    return result, mask
+    if return_mask:
+        return process_image_gpu(
+            image_float, window_size, threshold, device_label, return_mask=True
+        )
+    result = process_image_gpu(
+        image_float, window_size, threshold, device_label, return_mask=False
+    )
+    return result, None
 
 
 def process_channel_with_mask(channel, window_size, threshold, use_gpu=True):
@@ -125,45 +100,10 @@ def process_channel_with_mask(channel, window_size, threshold, use_gpu=True):
     Supports multiplatform GPU acceleration (CUDA/OpenCL) when available,
     with automatic fallback to CPU for unsupported platforms.
     """
-    # Auto-detect GPU device (CUDA/OpenCL/CPU) — cached after first call
     device_label = get_device() if use_gpu else "cpu"
-    if use_gpu and is_gpu_active():
-        # GPU path — dispatch to gpu_backend (returns result, but mask computed on CPU for now)
-        # Note: GPU backend returns processed channel; mask is derived from z_scores
-        # which is computed during GPU processing. For simplicity, we compute mask on CPU
-        # from the GPU-processed result. In production, mask would be computed on GPU too.
-        result = process_channel_gpu(channel, window_size, threshold, device_label)
-        # Recompute mask on CPU from result (since GPU backend doesn't return mask yet)
-        # This is a simplification — in production, mask would be returned from GPU
-        channel_float = channel.astype(np.float32)
-        ksize = (window_size, window_size)
-        mean = cv2.blur(channel_float, ksize)
-        squared = cv2.blur(channel_float ** 2, ksize)
-        variance = squared - (mean ** 2)
-        variance[variance < 0] = 0
-        std = np.sqrt(variance)
-        std[std == 0] = 1e-6
-        z_scores = np.abs((channel_float - mean) / std)
-        is_firefly = z_scores > threshold
-        return result, is_firefly
-    else:
-        # CPU fallback — original NumPy/CV2 path (always works, returns mask)
-        channel_float = channel.astype(np.float32)
-        ksize = (window_size, window_size)
-        mean = cv2.blur(channel_float, ksize)
-        squared = cv2.blur(channel_float ** 2, ksize)
-        variance = squared - (mean ** 2)
-        variance[variance < 0] = 0
-        std = np.sqrt(variance)
-        std[std == 0] = 1e-6
-        z_scores = np.abs((channel_float - mean) / std)
-        is_firefly = z_scores > threshold
-        half = window_size // 2
-        padded = np.pad(channel_float, half, mode='reflect')
-        windows = np.lib.stride_tricks.sliding_window_view(padded, (window_size, window_size))
-        median_filtered = np.median(windows, axis=(-2, -1))
-        result = np.where(is_firefly, median_filtered, channel_float)
-        return result, is_firefly
+    return process_channel_gpu(
+        channel, window_size, threshold, device_label, return_mask=True
+    )
 
 
 def array_to_qpixmap(arr, exposure=10.0):
@@ -302,7 +242,10 @@ class RenderWorker(QThread):
                 try:
                     image, _, compression = load_image(fpath)
                     # Use GPU acceleration for 4K+ images — significant speedup
-                    result, _ = process_image_full(image, self.window_size, self.threshold, use_gpu=self.use_gpu)
+                    result, _ = process_image_full(
+                        image, self.window_size, self.threshold,
+                        use_gpu=self.use_gpu, return_mask=False
+                    )
 
                     # Convert back to original dtype
                     result_out = result.copy()
@@ -341,7 +284,10 @@ class RenderWorker(QThread):
                     try:
                         image, _, compression = load_image(fpath)
                         # CPU fallback — no GPU acceleration
-                        result, _ = process_image_full(image, self.window_size, self.threshold, use_gpu=False)
+                        result, _ = process_image_full(
+                            image, self.window_size, self.threshold,
+                            use_gpu=False, return_mask=False
+                        )
 
                         # Convert back to original dtype
                         result_out = result.copy()
@@ -466,7 +412,7 @@ class ZoomableImagePreview(QWidget):
             old_size = self._zoom_state.image_size
             # Only reset zoom if the image dimensions changed (new image load)
             if old_size is None or old_size != (w, h):
-                self._zoom_state.set_image_size(w, h)
+                self._zoom_state.image_size = (w, h)
                 self._zoom_state.zoom_fit(self.width(), self.height())
         self.update()
 
