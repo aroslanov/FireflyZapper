@@ -32,6 +32,17 @@ class GPUBackendTests(unittest.TestCase):
         expected = backend.process_channel_cpu(self.image, 9, 3.0)
         np.testing.assert_array_equal(result, expected)
 
+    def test_even_window_uses_cpu_fallback_without_changing_shape(self):
+        with mock.patch.object(
+            backend, "_process_channel_cuda",
+            side_effect=AssertionError("even window must not launch GPU"),
+        ):
+            result, mask = backend.process_channel_gpu(
+                self.image, 14, 3.0, device_label="cuda", return_mask=True
+            )
+        self.assertEqual(result.shape, self.image.shape)
+        self.assertEqual(mask.shape, self.image.shape)
+
     def test_runtime_failure_disables_backend_and_returns_cpu_result(self):
         old_label = backend._device_label
         old_stats = backend._device_stats

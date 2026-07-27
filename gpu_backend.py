@@ -332,8 +332,16 @@ def process_channel_cpu(channel, window_size, threshold, return_mask=False):
     std = np.sqrt(variance)
     std[std == 0] = 1e-6
     mask = np.abs((channel_float - mean) / std) > threshold
-    half = window_size // 2
-    padded = np.pad(channel_float, half, mode="reflect")
+    # OpenCV's default anchor for an even kernel is k/2, so its footprint has
+    # one more sample above/left than below/right. Match that asymmetry here;
+    # symmetric padding would create an (H+1, W+1) sliding-window result.
+    leading = window_size // 2
+    trailing = window_size - leading - 1
+    padded = np.pad(
+        channel_float,
+        ((leading, trailing), (leading, trailing)),
+        mode="reflect",
+    )
     windows = np.lib.stride_tricks.sliding_window_view(
         padded, (window_size, window_size)
     )
