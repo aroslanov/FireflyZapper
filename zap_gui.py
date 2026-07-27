@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QGroupBox, QGridLayout, QSplitter, QTabWidget,
     QListWidget, QListWidgetItem, QLineEdit, QMessageBox,
     QScrollArea, QFrame, QSizePolicy, QComboBox, QCheckBox,
-    QProgressBar, QProgressDialog
+    QProgressBar, QProgressDialog, QInputDialog
 )
 from PySide6.QtCore import Qt, QTimer, Signal, Slot, QByteArray, QBuffer, QThread, QRectF, QObject
 from PySide6.QtGui import QPixmap, QImage, QFont, QPainter, QColor
@@ -38,6 +38,7 @@ THRESHOLD_MAX = 20.0
 WINDOW_SIZE_DEFAULT = 5
 THRESHOLD_DEFAULT = 3.0
 PRESETS_FILE = "presets.json"
+SETTINGS_FILE = "settings.json"
 PREVIEW_MAX_SIZE = 600
 
 
@@ -201,6 +202,44 @@ class PresetManager:
 
 
 # ──────────────────────────────────────────────
+# Settings Manager
+# ──────────────────────────────────────────────
+class SettingsManager:
+    """Persistent app settings (GPU toggle, last folders, etc.)."""
+
+    DEFAULTS = {
+        "use_gpu": True,
+        "last_image_dir": "",
+        "last_sequence_dir": "",
+    }
+
+    def __init__(self, filepath=SETTINGS_FILE):
+        self.filepath = filepath
+        self._data = dict(self.DEFAULTS)
+        self.load()
+
+    def load(self):
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, "r") as f:
+                    stored = json.load(f)
+                self._data = {**self.DEFAULTS, **stored}
+            except (json.JSONDecodeError, IOError):
+                self._data = dict(self.DEFAULTS)
+
+    def save(self):
+        with open(self.filepath, "w") as f:
+            json.dump(self._data, f, indent=2)
+
+    def get(self, key: str, default=None):
+        return self._data.get(key, default)
+
+    def set(self, key: str, value):
+        self._data[key] = value
+        self.save()
+
+
+# ──────────────────────────────────────────────
 # Render Worker Thread
 # ──────────────────────────────────────────────
 class RenderWorker(QThread):
@@ -248,6 +287,7 @@ class RenderWorker(QThread):
                     )
 
                     # Convert back to original dtype
+                    assert isinstance(result, np.ndarray)
                     result_out = result.copy()
                     if self.original_dtype == np.uint16:
                         result_out = (np.clip(result_out, 0, 1) * 65535).astype(np.uint16)
@@ -290,6 +330,7 @@ class RenderWorker(QThread):
                         )
 
                         # Convert back to original dtype
+                        assert isinstance(result, np.ndarray)
                         result_out = result.copy()
                         if self.original_dtype == np.uint16:
                             result_out = (np.clip(result_out, 0, 1) * 65535).astype(np.uint16)
@@ -578,8 +619,6 @@ class FireflyZapperGUI(QMainWindow):
         self.processed_image = None
         self.artifacts_mask = None
         self._exr_compression = None
-        self._last_image_dir = ""
-        self._last_sequence_dir = ""
 
         # ── Sequence state ──
         self.sequence_paths = []       # list of full file paths
@@ -588,7 +627,10 @@ class FireflyZapperGUI(QMainWindow):
         self.is_sequence_mode = False
 
         self.preset_manager = PresetManager()
+        self.settings = SettingsManager()
         self.render_worker = None
+        self._render_cancelled = False
+        self._progress_dialog = None
 
         # Central widget
         central = QWidget()
@@ -707,6 +749,7 @@ class FireflyZapperGUI(QMainWindow):
         main_layout.addWidget(splitter)
 
         self._apply_theme()
+        self._update_gpu_warning()
 
     # ── UI Builders ──
 
@@ -1028,6 +1071,12 @@ class FireflyZapperGUI(QMainWindow):
         )
         gl.addWidget(self.exposure_slider, 2, 2)
 
+        # GPU toggle
+        self.gpu_checkbox = QCheckBox("Use GPU Acceleration")
+        self.gpu_checkbox.setChecked(bool(self.settings.get("use_gpu", True)))
+        self.gpu_checkbox.toggled.connect(self._on_gpu_toggled)
+        gl.addWidget(self.gpu_checkbox, 3, 0, 1, 3)
+
         layout.addWidget(group)
 
     def _build_preset_section(self, layout):
@@ -1163,14 +1212,15 @@ class FireflyZapperGUI(QMainWindow):
     # ── Slots ──
 
     def _on_open_image(self):
+        last_dir: str = self.settings.get("last_image_dir", "") or ""
         filepath, _ = QFileDialog.getOpenFileName(
-            self, "Open Image", self._last_image_dir,
+            self, "Open Image", last_dir,
             "Images (*.exr *.jpg *.jpeg *.png *.bmp);;All Files (*)"
         )
         if not filepath:
             return
 
-        self._last_image_dir = os.path.dirname(filepath)
+        self.settings.set("last_image_dir", os.path.dirname(filepath))
 
         # Switch to single image mode
         self.is_sequence_mode = False
@@ -1206,19 +1256,70 @@ class FireflyZapperGUI(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to load image:\n{str(e)}")
             self.status_label.setText(f"Error: {str(e)}")
 
+    @staticmethod
+    def _detect_sequences(directory):
+        """Group files in a directory into sequences by naming pattern.
+        Returns a list of (label, [file_paths]) tuples."""
+        files = scan_sequence(directory)
+        if not files:
+            return []
+
+        # Group by stripping trailing frame numbers (e.g. _0001, .001, -001)
+        pattern = re.compile(r'[._\-]\d+$')
+        groups = {}
+        for fpath in files:
+            basename = os.path.splitext(os.path.basename(fpath))[0]
+            # Try to strip frame number suffix
+            stem = pattern.sub('', basename)
+            if stem not in groups:
+                groups[stem] = []
+            groups[stem].append(fpath)
+
+        # Sort groups by size (largest first), then alphabetically
+        sorted_groups = sorted(groups.items(), key=lambda x: (-len(x[1]), x[0]))
+        result = []
+        for stem, paths in sorted_groups:
+            label = f"{stem} ({len(paths)} frames)"
+            result.append((label, paths))
+        return result
+
     def _on_open_sequence(self):
+        last_dir: str = self.settings.get("last_sequence_dir", "") or ""
         directory = QFileDialog.getExistingDirectory(
-            self, "Open Image Sequence Folder", self._last_sequence_dir
+            self, "Open Image Sequence Folder", last_dir
         )
         if not directory:
             return
 
-        self._last_sequence_dir = directory
+        self.settings.set("last_sequence_dir", directory)
 
-        files = scan_sequence(directory)
-        if not files:
+        sequences = self._detect_sequences(directory)
+        if not sequences:
             QMessageBox.warning(self, "Warning", f"No supported images found in:\n{directory}")
             return
+
+        # If multiple sequences detected, show a selector
+        if len(sequences) > 1:
+            items = [label for label, _ in sequences]
+            item, ok = QInputDialog.getItem(
+                self, "Select Sequence",
+                f"Multiple sequences found in:\n{os.path.basename(directory)}\n\nChoose one:",
+                items, 0, False
+            )
+            if not ok or item is None:
+                return
+            selected_label = item
+            selected_paths = None
+            for label, paths in sequences:
+                if label == selected_label:
+                    selected_paths = paths
+                    break
+        else:
+            selected_paths = sequences[0][1]
+
+        if selected_paths is None:
+            return
+        files = selected_paths
 
         self.is_sequence_mode = True
         self.sequence_paths = files
@@ -1260,7 +1361,45 @@ class FireflyZapperGUI(QMainWindow):
         if directory:
             self.render_dir_edit.setText(directory)
 
+    def _on_gpu_toggled(self, checked):
+        self.settings.set("use_gpu", checked)
+        self._update_gpu_warning()
+
+    def _update_gpu_warning(self):
+        """If GPU is active but window_size > 7, show red warning on status + controls."""
+        ws = self.window_size_spin.value()
+        gpu_checked = self.gpu_checkbox.isChecked()
+        gpu_actually_active = gpu_checked and is_gpu_active()
+        too_large = ws > 7
+
+        if gpu_checked and too_large:
+            # Red warning: GPU is active but window too large
+            self.gpu_status_label.setStyleSheet(
+                "color: #ff4444; padding: 2px; font-weight: bold;"
+            )
+            self.gpu_status_label.setText(
+                "⚠ GPU acceleration: Inactive (window size > 7 — CPU fallback)"
+            )
+            self.window_size_spin.setStyleSheet(
+                "background-color: #5a2020; border: 1px solid #ff4444; border-radius: 3px; padding: 3px 5px; color: #e0e0e0;"
+            )
+            self.window_size_slider.setStyleSheet(
+                "QSlider::groove:horizontal { height: 6px; background: #5a2020; border-radius: 3px; } "
+                "QSlider::handle:horizontal { background: #ff4444; border: 1px solid #ff6666; width: 16px; height: 16px; margin: -5px 0; border-radius: 8px; }"
+            )
+        else:
+            # Normal styling
+            if gpu_actually_active:
+                self.gpu_status_label.setStyleSheet("color: #44ff44; padding: 2px; font-weight: bold;")
+                self.gpu_status_label.setText("GPU acceleration: Active")
+            else:
+                self.gpu_status_label.setStyleSheet("color: #888; padding: 2px; font-weight: bold;")
+                self.gpu_status_label.setText("GPU acceleration: Disabled (CPU fallback)")
+            self.window_size_spin.setStyleSheet("")
+            self.window_size_slider.setStyleSheet("")
+
     def _on_param_changed(self):
+        self._update_gpu_warning()
         if self.original_image is not None and self.auto_preview_cb.isChecked():
             try:
                 self._debounce_timer
@@ -1285,16 +1424,14 @@ class FireflyZapperGUI(QMainWindow):
 
         ws = self.window_size_spin.value()
         th = self.threshold_spin.value()
+        use_gpu = self.gpu_checkbox.isChecked()
 
-        # Check GPU acceleration status before processing
-        gpu_status = get_device_status()
-        self.gpu_status_label.setText(f"{gpu_status}")
+        self._update_gpu_warning()
         self.status_label.setText("Processing...")
         QApplication.processEvents()
 
         try:
-            # Use GPU acceleration if available — pass use_gpu=True
-            result, mask = process_image_full(self.original_image, ws, th, use_gpu=True)
+            result, mask = process_image_full(self.original_image, ws, th, use_gpu=use_gpu)
             self.processed_image = result
             self.artifacts_mask = mask
 
@@ -1302,25 +1439,18 @@ class FireflyZapperGUI(QMainWindow):
             self.preview_processed.set_image(result, ev)
             self.preview_processed_only.set_image(result, ev)
 
+            mask_arr = mask if mask is not None else np.zeros(self.original_image.shape[:2], dtype=bool)
             blended = self.original_image.copy()
-            blended[mask] = blended[mask] * 0.4 + np.array([1.0, 0.0, 0.0]) * 0.6
+            blended[mask_arr] = blended[mask_arr] * 0.4 + np.array([1.0, 0.0, 0.0]) * 0.6
             self.preview_mask.set_image(blended, ev)
 
-            num_fireflies = int(np.sum(mask))
-            total_pixels = np.size(mask)  # total elements in numpy array
+            num_fireflies = int(np.sum(mask_arr))
+            total_pixels = np.size(mask_arr)  # total elements in numpy array
             pct = 100.0 * num_fireflies / total_pixels
-            # Format GPU status info — gpu_status is a string from get_device_status()
-            # Extract device name from status string
-            if "GPU:" in gpu_status:
-                # Format: "GPU: CUDA — Name (cores, MB) | Acceleration: Active"
-                gpu_name = gpu_status.split("—")[0].replace("GPU:", "").strip() if "—" in gpu_status else gpu_status.split("|")[0].strip()
-            else:
-                # Format: "CPU fallback — Name (cores) | Acceleration: Disabled"
-                gpu_name = "CPU"
-            gpu_active = "Active" if is_gpu_active() else "Disabled"
+            gpu_active_str = "Active" if (use_gpu and is_gpu_active()) else "Disabled"
             self.status_label.setText(
                 f"Done — {num_fireflies} firefly pixels ({pct:.3f}%) detected | "
-                f"ws={ws}, th={th:.1f} | GPU: {gpu_name} acceleration {gpu_active}"
+                f"ws={ws}, th={th:.1f} | GPU: {gpu_active_str}"
             )
             self.btn_save.setEnabled(True)
 
@@ -1350,6 +1480,7 @@ class FireflyZapperGUI(QMainWindow):
             return
 
         try:
+            assert isinstance(self.processed_image, np.ndarray)
             result_out = self.processed_image.copy()
             if self.original_dtype == np.uint16:
                 result_out = (np.clip(result_out, 0, 1) * 65535).astype(np.uint16)
@@ -1376,6 +1507,7 @@ class FireflyZapperGUI(QMainWindow):
 
         ws = self.window_size_spin.value()
         th = self.threshold_spin.value()
+        use_gpu = self.gpu_checkbox.isChecked()
 
         # Determine output directory
         output_dir = self.render_dir_edit.text().strip()
@@ -1402,6 +1534,18 @@ class FireflyZapperGUI(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
+        # Lock interface with a modal progress dialog
+        self._render_cancelled = False
+        self._progress_dialog = QProgressDialog(
+            "Rendering sequence...", "Cancel", 0, len(self.sequence_paths), self
+        )
+        self._progress_dialog.setWindowTitle("Rendering")
+        self._progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self._progress_dialog.setMinimumDuration(0)
+        self._progress_dialog.setValue(0)
+        self._progress_dialog.canceled.connect(self._on_render_cancel)
+        self._progress_dialog.show()
+
         # Disable controls during render
         self._set_sequence_controls_enabled(False)
         self.btn_process.setEnabled(False)
@@ -1412,20 +1556,9 @@ class FireflyZapperGUI(QMainWindow):
         self.render_progress.setValue(0)
         self.status_label.setText("Rendering sequence...")
 
-        # Check GPU acceleration status before starting render
-        gpu_status = get_device_status()
-        self.gpu_status_label.setText(f"{gpu_status}")
-        gpu_active = is_gpu_active()
-        if gpu_active:
-            # GPU acceleration active — pass use_gpu=True to RenderWorker
-            self.render_worker = RenderWorker(
-                self.sequence_paths, output_dir, ws, th, self.original_dtype, use_gpu=True
-            )
-        else:
-            # CPU fallback — pass use_gpu=False to RenderWorker
-            self.render_worker = RenderWorker(
-                self.sequence_paths, output_dir, ws, th, self.original_dtype, use_gpu=False
-            )
+        self.render_worker = RenderWorker(
+            self.sequence_paths, output_dir, ws, th, self.original_dtype, use_gpu=use_gpu
+        )
         self.render_worker.progress.connect(self._on_render_progress)
         self.render_worker.frame_done.connect(self._on_render_frame_done)
         self.render_worker.finished.connect(self._on_render_finished)
@@ -1433,14 +1566,44 @@ class FireflyZapperGUI(QMainWindow):
         self.render_worker.start()
 
     def _on_render_progress(self, frame_index, filename):
-        self.status_label.setText(f"Rendering: {filename} ({frame_index + 1}/{len(self.sequence_paths)})")
+        total = len(self.sequence_paths) if self.sequence_paths else 0
+        self.status_label.setText(f"Rendering: {filename} ({frame_index + 1}/{total})")
 
     def _on_render_frame_done(self, done, total):
         self.render_progress.setValue(done)
+        if hasattr(self, '_progress_dialog') and self._progress_dialog is not None:
+            self._progress_dialog.setValue(done)
+            self._progress_dialog.setLabelText(
+                f"Rendering frame {done}/{total}..."
+            )
+
+    def _on_render_cancel(self):
+        """Cancel the render from the modal progress dialog."""
+        self._render_cancelled = True
+        if self.render_worker is not None:
+            self.render_worker.cancel()
+        if self._progress_dialog is not None:
+            self._progress_dialog.close()
+            self._progress_dialog = None
+        self.status_label.setText("Render cancelled by user")
 
     def _on_render_finished(self):
-        self.render_progress.setValue(len(self.sequence_paths))
-        self.status_label.setText(f"Render complete — {len(self.sequence_paths)} frames processed")
+        # Close modal dialog if still open
+        if hasattr(self, '_progress_dialog') and self._progress_dialog is not None:
+            self._progress_dialog.close()
+            self._progress_dialog = None
+
+        total = len(self.sequence_paths) if self.sequence_paths else 0
+
+        if self._render_cancelled:
+            self._set_sequence_controls_enabled(True)
+            self.btn_process.setEnabled(True)
+            self.btn_render.setEnabled(True)
+            self.render_progress.setVisible(False)
+            return
+
+        self.render_progress.setValue(total)
+        self.status_label.setText(f"Render complete — {total} frames processed")
 
         # Re-enable controls
         self._set_sequence_controls_enabled(True)
@@ -1449,11 +1612,18 @@ class FireflyZapperGUI(QMainWindow):
 
         QMessageBox.information(
             self, "Render Complete",
-            f"Successfully processed {len(self.sequence_paths)} frames."
+            f"Successfully processed {total} frames."
         )
 
     def _on_render_error(self, msg):
         self.status_label.setText(f"Render error: {msg}")
+        if hasattr(self, '_progress_dialog') and self._progress_dialog is not None:
+            self._progress_dialog.close()
+            self._progress_dialog = None
+        # Re-enable controls as a safety net
+        self._set_sequence_controls_enabled(True)
+        self.btn_process.setEnabled(True)
+        self.btn_render.setEnabled(True)
 
     def _on_preset_selected(self, item):
         name = item.text()
