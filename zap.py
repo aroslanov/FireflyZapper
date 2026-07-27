@@ -5,10 +5,19 @@ import OpenEXR
 import Imath
 import os
 
+# Multiplatform GPU acceleration backend
+# Auto-detects CUDA (NVIDIA), OpenCL (AMD/Intel/NVIDIA), or CPU fallback
+from gpu_backend import get_device, process_channel_gpu, process_image_gpu, get_device_status, is_gpu_active
+
 # Constants for supported extensions and default values
 SUPPORTED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.bmp', '.exr']
 WINDOW_SIZE_DEFAULT = 5
 THRESHOLD_DEFAULT = 3.0
+# 4K image support — typical 4K image is 3840×2160 = 8.3M pixels per channel
+# GPU acceleration is most beneficial for 4K+ images where CPU blur/median
+# can take several seconds per channel
+K4_SIZE = (3840, 2160)
+K4_PIXELS = 8_294_400
 
 def read_exr(filename):
     """
@@ -76,50 +85,66 @@ def write_exr(filename, data, compression=None):
     out.writePixels({'R': R, 'G': G, 'B': B})
     out.close()
 
-def process_channel(channel, window_size, threshold):
+def process_channel(channel, window_size, threshold, use_gpu=True):
     """
     Process a single channel to remove fireflies using local statistics and median filtering.
+    Supports multiplatform GPU acceleration (CUDA/OpenCL) when available,
+    with automatic fallback to CPU for unsupported platforms.
 
     Args:
         channel (np.ndarray): A NumPy array representing the image channel.
         window_size (int): The size of the window for computing local statistics.
         threshold (float): Z-score threshold for detecting fireflies.
+        use_gpu (bool, optional): Whether to use GPU acceleration if available.
+            Defaults to True. Falls back to CPU if GPU unavailable or unsupported.
 
     Returns:
         np.ndarray: Processed channel with fireflies removed.
     """
-    channel_float = channel.astype(np.float32)
+    # Auto-detect GPU device (CUDA/OpenCL/CPU) — cached after first call
+    device_label = get_device if use_gpu else "cpu"
+    if use_gpu and is_gpu_active:
+        # GPU path — dispatch to gpu_backend
+        result = process_channel_gpu(channel, window_size, threshold, device_label)
+        return result
+    else:
+        # CPU fallback — original NumPy/CV2 path (always works)
+        channel_float = channel.astype(np.float32)
 
-    ksize = (window_size, window_size)
-    mean = cv2.blur(channel_float, ksize)
-    squared = cv2.blur(channel_float ** 2, ksize)
-    variance = squared - (mean ** 2)
-    variance[variance < 0] = 0
-    std = np.sqrt(variance)
-    std[std == 0] = 1e-6
+        ksize = (window_size, window_size)
+        mean = cv2.blur(channel_float, ksize)
+        squared = cv2.blur(channel_float ** 2, ksize)
+        variance = squared - (mean ** 2)
+        variance[variance < 0] = 0
+        std = np.sqrt(variance)
+        std[std == 0] = 1e-6
 
-    z_scores = np.abs((channel_float - mean) / std)
-    is_firefly = z_scores > threshold
+        z_scores = np.abs((channel_float - mean) / std)
+        is_firefly = z_scores > threshold
 
-    # medianBlur only supports uint8, so implement a float32-compatible median filter
-    # using numpy sliding_window_view (available in numpy 1.20+)
-    half = window_size // 2
-    padded = np.pad(channel_float, half, mode='reflect')
-    windows = np.lib.stride_tricks.sliding_window_view(padded, (window_size, window_size))
-    median_filtered = np.median(windows, axis=(-2, -1))
+        # medianBlur only supports uint8, so implement a float32-compatible median filter
+        # using numpy sliding_window_view (available in numpy 1.20+)
+        half = window_size // 2
+        padded = np.pad(channel_float, half, mode='reflect')
+        windows = np.lib.stride_tricks.sliding_window_view(padded, (window_size, window_size))
+        median_filtered = np.median(windows, axis=(-2, -1))
 
-    result = np.where(is_firefly, median_filtered, channel_float)
-    return result
+        result = np.where(is_firefly, median_filtered, channel_float)
+        return result
 
-def process_image(input_path, output_path, window_size, threshold):
+def process_image(input_path, output_path, window_size, threshold, use_gpu=True):
     """
     Process an image to remove fireflies by processing each channel individually.
+    Supports multiplatform GPU acceleration (CUDA/OpenCL) when available,
+    with automatic fallback to CPU for unsupported platforms.
 
     Args:
         input_path (str): Path to the input image file.
         output_path (str): Path to the output image file.
         window_size (int): The size of the window for computing local statistics.
         threshold (float): Z-score threshold for detecting fireflies.
+        use_gpu (bool, optional): Whether to use GPU acceleration if available.
+            Defaults to True. Falls back to CPU if GPU unavailable or unsupported.
     """
     if input_path.endswith('.exr'):
         image, compression = read_exr(input_path)
@@ -135,7 +160,7 @@ def process_image(input_path, output_path, window_size, threshold):
         elif image.dtype == np.float32:
             original_dtype = np.float32
         elif image.dtype == np.uint8:
-            original_dtype = np.uint8
+        original_dtype = np.uint8
         else:
             raise ValueError(f"Unsupported image type: {image.dtype}")
 
@@ -144,12 +169,17 @@ def process_image(input_path, output_path, window_size, threshold):
     elif original_dtype == np.uint8:
         image = image.astype(np.float32) / 255.0
 
-    if len(image.shape) == 3:
-        channels = cv2.split(image)
-        processed_channels = [process_channel(chan, window_size, threshold) for chan in channels]
-        result = cv2.merge(processed_channels)
+    # GPU acceleration for 4K+ images — dispatch to gpu_backend if available
+    if use_gpu and is_gpu_active:
+        result = process_image_gpu(image, window_size, threshold, device_label=get_device)
     else:
-        result = process_channel(image, window_size, threshold)
+        # CPU fallback — original NumPy/CV2 path
+        if len(image.shape) == 3:
+            channels = cv2.split(image)
+            processed_channels = [process_channel(chan, window_size, threshold, use_gpu=False) for chan in channels]
+            result = cv2.merge(processed_channels)
+        else:
+            result = process_channel(image, window_size, threshold, use_gpu=False)
 
     if original_dtype == np.uint16:
         result = (result * 65535).astype(np.uint16)
@@ -220,13 +250,33 @@ def get_output_path(input_path, output_dir, prefix=None):
     return os.path.join(output_dir, output_filename)
 
 def main():
-    parser = argparse.ArgumentParser(description='Firefly removal from images.')
+    parser = argparse.ArgumentParser(description='Firefly removal from images with multiplatform GPU acceleration.')
     parser.add_argument('input', type=str, help='Input directory or image file')
     parser.add_argument('output', type=str, help='Output directory or image file')
     parser.add_argument('--window_size', type=int, default=WINDOW_SIZE_DEFAULT, help='Window size for local statistics')
     parser.add_argument('--threshold', type=float, default=THRESHOLD_DEFAULT, help='Z-score threshold for firefly detection')
+    parser.add_argument('--use_gpu', type=bool, default=True, nargs='?', const=True, help='Use GPU acceleration if available (CUDA/OpenCL). Falls back to CPU if unavailable.')
+    parser.add_argument('--no_gpu', type=bool, default=False, nargs='?', const=False, help='Force CPU processing even if GPU is available. Useful for debugging or unsupported image types.')
 
     args = parser.parse_args()
+
+    # Resolve GPU flag — --use_gpu takes precedence over --no-gpu
+    use_gpu_flag = args.use_gpu if args.use_gpu else False
+    if args.no_gpu:
+        use_gpu_flag = False
+    else:
+        use_gpu_flag = True
+
+    # Auto-detect GPU device for status display
+    device_label = get_device()
+    gpu_status = get_device_status()
+    if use_gpu_flag and is_gpu_active:
+        # GPU acceleration enabled — print device info
+        print(f"GPU acceleration: {gpu_status}")
+    else:
+        # CPU fallback
+        print(f"GPU acceleration: Disabled (CPU fallback)")
+    gpu_active = is_gpu_active if use_gpu_flag else False
 
     input_path = os.path.abspath(args.input)
     output_path = os.path.abspath(args.output)
@@ -245,7 +295,8 @@ def main():
             if any(input_file_path.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
                 output_filename = get_output_path(input_file_path, output_dir, prefix)
                 print(f"Processing {input_file_path}...")
-                process_image(input_file_path, output_filename, args.window_size, args.threshold)
+                # Pass GPU flag to process_image — auto-dispatch inside
+                process_image(input_file_path, output_filename, args.window_size, args.threshold, use_gpu=use_gpu_flag)
     elif os.path.isfile(input_path):
         if any(input_path.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
             input_dir = os.path.dirname(input_path)
@@ -257,11 +308,11 @@ def main():
                 output_file_path = output_path
 
             print(f"Processing {input_path}...")
-            process_image(input_path, output_file_path, args.window_size, args.threshold)
+            process_image(input_path, output_file_path, args.window_size, args.threshold, use_gpu=use_gpu_flag)
         else:
             raise ValueError("Invalid input file. Please provide a supported image file.")
     else:
         raise ValueError("Invalid input/output paths. Please provide valid directories or files.")
 
-if __name__ == "__main__":
+if __name__ = "__main__":
     main()

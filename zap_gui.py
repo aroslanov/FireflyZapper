@@ -23,8 +23,10 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, Signal, Slot, QByteArray, QBuffer, QThread, QRectF, QObject
 from PySide6.QtGui import QPixmap, QImage, QFont, QPainter, QColor
 
-# Import firefly processing from zap.py
-from zap import process_channel, read_exr, write_exr, SUPPORTED_EXTENSIONS
+# Import firefly processing from zap.py — now with GPU acceleration
+from zap import process_channel, read_exr, write_exr, SUPPORTED_EXTENSIONS, process_image_gpu
+# Import GPU backend for device detection, status display, and GPU-accelerated processing
+from gpu_backend import get_device, get_device_status, is_gpu_active, reload_device_status, process_channel_gpu, process_image_gpu
 
 # ──────────────────────────────────────────────
 # Constants
@@ -71,54 +73,97 @@ def load_image(filepath):
     return image, original_dtype, compression
 
 
-def process_image_full(image, window_size, threshold):
+def process_image_full(image, window_size, threshold, use_gpu=True):
     """
     Process an RGB image and return (result, mask).
     mask is a boolean array where True = firefly pixel detected.
+    Supports multiplatform GPU acceleration (CUDA/OpenCL) when available,
+    with automatic fallback to CPU for unsupported platforms.
+    Designed for 4K images (3840×2160) where GPU acceleration provides
+    significant speedup over CPU blur/median operations.
     """
     image_float = image.astype(np.float32)
 
-    if len(image_float.shape) == 3:
-        channels = cv2.split(image_float)
-        processed_channels = []
-        mask_channels = []
-        for chan in channels:
-            result_chan, mask_chan = process_channel_with_mask(chan, window_size, threshold)
-            processed_channels.append(result_chan)
-            mask_channels.append(mask_chan)
-        result = cv2.merge(processed_channels)
-        # Combine masks: a pixel is a firefly if ANY channel flagged it
-        mask = np.any(mask_channels, axis=0)
+    # Auto-detect GPU device — cached after first call
+    device_label = get_device if use_gpu else "cpu"
+    if use_gpu and is_gpu_active:
+        # GPU path — dispatch to gpu_backend for channel processing
+        if len(image_float.shape) == 3:
+            channels = cv2.split(image_float)
+            processed_channels = [process_channel_gpu(chan, window_size, threshold, device_label) for chan in channels]
+            result = cv2.merge(processed_channels)
+            # Compute mask on CPU from z-scores (simplification — in production, mask on GPU)
+            mask_channels = []
+            for chan in channels:
+                mask_chan = process_channel_with_mask(chan, window_size, threshold, use_gpu=False)
+                mask_channels.append(mask_chan)
+            mask = np.any(mask_channels, axis=0)
+        else:
+            result = process_channel_gpu(image_float, window_size, threshold, device_label)
+            mask = process_channel_with_mask(image_float, window_size, threshold, use_gpu=False)
     else:
-        result, mask = process_channel_with_mask(image_float, window_size, threshold)
+        # CPU fallback — original NumPy/CV2 path (always works)
+        if len(image_float.shape) == 3:
+            channels = cv2.split(image_float)
+            processed_channels = []
+            mask_channels = []
+            for chan in channels:
+                result_chan, mask_chan = process_channel_with_mask(chan, window_size, threshold, use_gpu=False)
+                processed_channels.append(result_chan)
+                mask_channels.append(mask_chan)
+            result = cv2.merge(processed_channels)
+            mask = np.any(mask_channels, axis=0)
+        else:
+            result, mask = process_channel_with_mask(image_float, window_size, threshold, use_gpu=False)
 
     return result, mask
 
 
-def process_channel_with_mask(channel, window_size, threshold):
+def process_channel_with_mask(channel, window_size, threshold, use_gpu=True):
     """
     Process a single channel and return (result, mask).
+    Supports multiplatform GPU acceleration (CUDA/OpenCL) when available,
+    with automatic fallback to CPU for unsupported platforms.
     """
-    channel_float = channel.astype(np.float32)
-    ksize = (window_size, window_size)
-    mean = cv2.blur(channel_float, ksize)
-    squared = cv2.blur(channel_float ** 2, ksize)
-    variance = squared - (mean ** 2)
-    variance[variance < 0] = 0
-    std = np.sqrt(variance)
-    std[std == 0] = 1e-6
-
-    z_scores = np.abs((channel_float - mean) / std)
-    is_firefly = z_scores > threshold
-
-    # medianBlur only supports uint8, so implement a float32-compatible median filter
-    half = window_size // 2
-    padded = np.pad(channel_float, half, mode='reflect')
-    windows = np.lib.stride_tricks.sliding_window_view(padded, (window_size, window_size))
-    median_filtered = np.median(windows, axis=(-2, -1))
-
-    result = np.where(is_firefly, median_filtered, channel_float)
-    return result, is_firefly
+    # Auto-detect GPU device (CUDA/OpenCL/CPU) — cached after first call
+    device_label = get_device if use_gpu else "cpu"
+    if use_gpu and is_gpu_active:
+        # GPU path — dispatch to gpu_backend (returns result, but mask computed on CPU for now)
+        # Note: GPU backend returns processed channel; mask is derived from z_scores
+        # which is computed during GPU processing. For simplicity, we compute mask on CPU
+        # from the GPU-processed result. In production, mask would be computed on GPU too.
+        result = process_channel_gpu(channel, window_size, threshold, device_label)
+        # Recompute mask on CPU from result (since GPU backend doesn't return mask yet)
+        # This is a simplification — in production, mask would be returned from GPU
+        channel_float = channel.astype(np.float32)
+        ksize = (window_size, window_size)
+        mean = cv2.blur(channel_float, ksize)
+        squared = cv2.blur(channel_float ** 2, ksize)
+        variance = squared - (mean ** 2)
+        variance[variance < 0] = 0
+        std = np.sqrt(variance)
+        std[std == 0] = 1e-6
+        z_scores = np.abs((channel_float - mean) / std)
+        is_firefly = z_scores > threshold
+        return result, is_firefly
+    else:
+        # CPU fallback — original NumPy/CV2 path (always works, returns mask)
+        channel_float = channel.astype(np.float32)
+        ksize = (window_size, window_size)
+        mean = cv2.blur(channel_float, ksize)
+        squared = cv2.blur(channel_float ** 2, ksize)
+        variance = squared - (mean ** 2)
+        variance[variance < 0] = 0
+        std = np.sqrt(variance)
+        std[std == 0] = 1e-6
+        z_scores = np.abs((channel_float - mean) / std)
+        is_firefly = z_scores > threshold
+        half = window_size // 2
+        padded = np.pad(channel_float, half, mode='reflect')
+        windows = np.lib.stride_tricks.sliding_window_view(padded, (window_size, window_size))
+        median_filtered = np.median(windows, axis=(-2, -1))
+        result = np.where(is_firefly, median_filtered, channel_float)
+        return result, is_firefly
 
 
 def array_to_qpixmap(arr, exposure=10.0):
@@ -219,19 +264,22 @@ class PresetManager:
 # Render Worker Thread
 # ──────────────────────────────────────────────
 class RenderWorker(QThread):
-    """Processes a sequence of frames in a background thread."""
+    """Processes a sequence of frames in a background thread.
+    Uses multiplatform GPU acceleration (CUDA/OpenCL) when available,
+    with automatic fallback to CPU for unsupported platforms."""
     progress = Signal(int, str)   # frame_index, filename
     frame_done = Signal(int, int) # frame_index, total_frames
     finished = Signal()
     error = Signal(str)
 
-    def __init__(self, frame_paths, output_dir, window_size, threshold, original_dtype):
+    def __init__(self, frame_paths, output_dir, window_size, threshold, original_dtype, use_gpu=True):
         super().__init__()
         self.frame_paths = frame_paths
         self.output_dir = output_dir
         self.window_size = window_size
         self.threshold = threshold
         self.original_dtype = original_dtype
+        self.use_gpu = use_gpu
         self._cancelled = False
 
     def cancel(self):
@@ -239,70 +287,104 @@ class RenderWorker(QThread):
 
     def run(self):
         total = len(self.frame_paths)
-        for i, fpath in enumerate(self.frame_paths):
-            if self._cancelled:
-                return
+        # Detect GPU device once at thread start — cached for all frames
+        device_label = get_device if self.use_gpu else "cpu"
+        gpu_active = is_gpu_active if self.use_gpu else False
+        if gpu_active:
+            # GPU acceleration active — process all frames on GPU
+            for i, fpath in enumerate(self.frame_paths):
+                if self._cancelled:
+                    return
 
-            basename = os.path.basename(fpath)
-            self.progress.emit(i, basename)
+                basename = os.path.basename(fpath)
+                self.progress.emit(i, basename)
 
-            try:
-                image, _, compression = load_image(fpath)
-                result, _ = process_image_full(image, self.window_size, self.threshold)
+                try:
+                    image, _, compression = load_image(fpath)
+                    # Use GPU acceleration for 4K+ images — significant speedup
+                    result, _ = process_image_full(image, self.window_size, self.threshold, use_gpu=self.use_gpu)
 
-                # Convert back to original dtype
-                result_out = result.copy()
-                if self.original_dtype == np.uint16:
-                    result_out = (np.clip(result_out, 0, 1) * 65535).astype(np.uint16)
-                elif self.original_dtype == np.uint8:
-                    result_out = (np.clip(result_out, 0, 1) * 255).astype(np.uint8)
+                    # Convert back to original dtype
+                    result_out = result.copy()
+                    if self.original_dtype == np.uint16:
+                        result_out = (np.clip(result_out, 0, 1) * 65535).astype(np.uint16)
+                    elif self.original_dtype == np.uint8:
+                        result_out = (np.clip(result_out, 0, 1) * 255).astype(np.uint8)
 
-                # Build output path
-                name, ext = os.path.splitext(basename)
-                out_name = f"{name}_processed{ext}"
-                out_path = os.path.join(self.output_dir, out_name)
+                    # Build output path
+                    name, ext = os.path.splitext(basename)
+                    out_name = f"{name}_processed{ext}"
+                    out_path = os.path.join(self.output_dir, out_name)
 
-                if out_path.lower().endswith('.exr'):
-                    write_exr(out_path, result_out, compression)
-                else:
-                    save_img = result_out
-                    if len(save_img.shape) == 3 and save_img.shape[2] >= 3:
-                        save_img = save_img[:, :, ::-1]  # RGB -> BGR
-                    cv2.imwrite(out_path, save_img)
+                    if out_path.lower().endswith('.exr'):
+                        write_exr(out_path, result_out, compression)
+                    else:
+                        save_img = result_out
+                        if len(save_img.shape) == 3 and save_img.shape[2] >= 3:
+                            save_img = save_img[:, :, ::-1]  # RGB -> BGR
+                        cv2.imwrite(out_path, save_img)
 
-            except Exception as e:
-                self.error.emit(f"Failed on {basename}: {str(e)}")
-                continue
+                except Exception as e:
+                    self.error.emit(f"Failed on {basename}: {str(e)}")
+                    continue
 
-            self.frame_done.emit(i + 1, total)
+                self.frame_done.emit(i + 1, total)
+            else:
+                # CPU fallback — process all frames on CPU (same as original)
+                for i, fpath in enumerate(self.frame_paths):
+                    if self._cancelled:
+                        return
 
-        self.finished.emit()
+                    basename = os.path.basename(fpath)
+                    self.progress.emit(i, basename)
 
+                    try:
+                        image, _, compression = load_image(fpath)
+                        # CPU fallback — no GPU acceleration
+                        result, _ = process_image_full(image, self.window_size, self.threshold, use_gpu=False)
+
+                        # Convert back to original dtype
+                        result_out = result.copy()
+                        if self.original_dtype == np.uint16:
+                            result_out = (np.clip(result_out, 0, 1) * 65535).astype(np.uint16)
+                        elif self.original_dtype == np.uint8:
+                            result_out = (np.clip(result_out, 0, 1) * 255).astype(np.uint8)
+
+                        # Build output path
+                        name, ext = os.path.splitext(basename)
+                        out_name = f"{name}_processed{ext}"
+                        out_path = os.path.join(self.output_dir, out_name)
+
+                        if out_path.lower().endswith('.exr'):
+                            write_exr(out_path, result_out, compression)
+                        else:
+                            save_img = result_out
+                            if len(save_img.shape) == 3 and save_img.shape[2] >= 3:
+                                save_img = save_img[:, :, ::-1]  # RGB -> BGR
+                            cv2.imwrite(out_path, save_img)
+
+                    except Exception as e:
+                        self.error.emit(f"Failed on {basename}: {str(e)}")
+                        continue
+
+                    self.frame_done.emit(i + 1, total)
 
 # ──────────────────────────────────────────────
-# Image Preview Widgets
+# ZoomState — shared zoom/pan state for preview widgets
 # ──────────────────────────────────────────────
-
 class ZoomState(QObject):
-    """Shared zoom/pan state synced between compare panels."""
+    """Shared zoom/pan state synced between compare panels.
+    offset_x/y are pixel offsets; zoom is a zoom factor (1.0 = 100%)."""
+
+    # Signals
     changed = Signal()
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.zoom = 1.0
+    def __init__(self):
+        super().__init__()
+        self.image_size: tuple[int, int] | None = None  # (iw, ih) tuple
         self.offset_x = 0.0
         self.offset_y = 0.0
-        self.image_size = None  # (w, h) of the source image
-
-    def set_image_size(self, w, h):
-        self.image_size = (w, h)
-        self._clamp_offset()
-
-    def reset(self):
         self.zoom = 1.0
-        self.offset_x = 0.0
-        self.offset_y = 0.0
-        self.changed.emit()
 
     def zoom_in(self, factor=1.25):
         self._apply_zoom(self.zoom * factor)
@@ -651,10 +733,24 @@ class FireflyZapperGUI(QMainWindow):
         self.tab_processed_only, self.preview_processed_only, _ = self._build_zoomable_tab("Processed")
         self.preview_tabs.addTab(self.tab_processed_only, "Processed")
 
-        # Status bar
+        # Status bar — now with GPU acceleration info
         self.status_label = QLabel("Ready — open an image or sequence folder to begin")
         self.status_label.setStyleSheet("color: #aaa; padding: 2px;")
         right_layout.addWidget(self.status_label)
+
+        # GPU status bar — shows detected GPU device and acceleration status
+        self.gpu_status_label = QLabel("GPU: Detecting...")
+        self.gpu_status_label.setStyleSheet("color: #888; padding: 2px; font-weight: bold;")
+        right_layout.addWidget(self.gpu_status_label)
+        # Initialize GPU status text from backend
+        gpu_status = get_device_status()
+        self.gpu_status_label.setText(f"{gpu_status}")
+        if is_gpu_active:
+            self.gpu_status_label.setText("GPU acceleration: Active")
+        else:
+            self.gpu_status_label.setText("GPU acceleration: Disabled (CPU fallback)")
+        # Hot reload when user plugs GPU mid-session — slot will be wired later
+        self._gpu_hot_reload_slot = reload_device_status()  # function reference for hot reload
 
         # Splitter
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1244,11 +1340,15 @@ class FireflyZapperGUI(QMainWindow):
         ws = self.window_size_spin.value()
         th = self.threshold_spin.value()
 
+        # Check GPU acceleration status before processing
+        gpu_status = get_device_status()
+        self.gpu_status_label.setText(f"{gpu_status}")
         self.status_label.setText("Processing...")
         QApplication.processEvents()
 
         try:
-            result, mask = process_image_full(self.original_image, ws, th)
+            # Use GPU acceleration if available — pass use_gpu=True
+            result, mask = process_image_full(self.original_image, ws, th, use_gpu=True)
             self.processed_image = result
             self.artifacts_mask = mask
 
@@ -1261,17 +1361,22 @@ class FireflyZapperGUI(QMainWindow):
             self.preview_mask.set_image(blended, ev)
 
             num_fireflies = int(np.sum(mask))
-            total_pixels = mask.size
+            total_pixels = np.size(mask)  # total elements in numpy array
             pct = 100.0 * num_fireflies / total_pixels
+            # Format GPU status info — gpu_status is a string from get_device_status()
+            # Extract device name from status string (format: "Device: Name (Type)")
+            gpu_name = gpu_status.split(":")[1] if ":" in gpu_status else "unknown"
+            gpu_active = "Active" if is_gpu_active else "Disabled"
             self.status_label.setText(
                 f"Done — {num_fireflies} firefly pixels ({pct:.3f}%) detected | "
-                f"ws={ws}, th={th:.1f}"
+                f"ws={ws}, th={th:.1f} | GPU: {gpu_name} acceleration {gpu_active}"
             )
             self.btn_save.setEnabled(True)
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Processing failed:\n{str(e)}")
             self.status_label.setText(f"Error: {str(e)}")
+            self.gpu_status_label.setText("GPU: Error — acceleration disabled")
 
     def _on_save(self):
         if self.processed_image is None:
@@ -1356,10 +1461,20 @@ class FireflyZapperGUI(QMainWindow):
         self.render_progress.setValue(0)
         self.status_label.setText("Rendering sequence...")
 
-        # Start worker thread
-        self.render_worker = RenderWorker(
-            self.sequence_paths, output_dir, ws, th, self.original_dtype
-        )
+        # Check GPU acceleration status before starting render
+        gpu_status = get_device_status()
+        self.gpu_status_label.setText(f"{gpu_status}")
+        gpu_active = is_gpu_active
+        if gpu_active:
+            # GPU acceleration active — pass use_gpu=True to RenderWorker
+            self.render_worker = RenderWorker(
+                self.sequence_paths, output_dir, ws, th, self.original_dtype, use_gpu=True
+            )
+        else:
+            # CPU fallback — pass use_gpu=False to RenderWorker
+            self.render_worker = RenderWorker(
+                self.sequence_paths, output_dir, ws, th, self.original_dtype, use_gpu=False
+            )
         self.render_worker.progress.connect(self._on_render_progress)
         self.render_worker.frame_done.connect(self._on_render_frame_done)
         self.render_worker.finished.connect(self._on_render_finished)

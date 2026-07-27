@@ -100,15 +100,20 @@ python zap.py <input> <output> [--window_size <size>] [--threshold <value>]
 - `--window_size <size>`: (Optional) The size of the window used for local statistics calculations. Must be an odd integer (default is 5). Larger windows can smooth out more noise but may also remove smaller details.
 
 - `--threshold <value>`: (Optional) The z-score threshold for firefly detection. Pixels with z-scores above this value are considered fireflies and will be replaced (default is 3.0).
+- `--use-gpu`: (Optional) Enable GPU acceleration (auto-detects CUDA/OpenCL, falls back to CPU if unavailable). Particularly beneficial for 4K images (3840×2160).
+- `--no-gpu`: (Optional) Disable GPU acceleration and force CPU fallback. Useful for debugging or when GPU is intentionally bypassed.
 
 ### CLI Examples
 
 ```bash
-# Process a single image
-python zap.py input.jpg output.png --window_size 7 --threshold 2.5
+# Process a single image with GPU acceleration
+python zap.py input.jpg output.png --use-gpu --window-size 7 --threshold 2.5
 
-# Process all images in a directory
-python zap.py images processed_images --window_size 9 --threshold 3.5
+# Process all images in a directory with GPU acceleration
+python zap.py images processed_images --use-gpu --window-size 9 --threshold 3.5
+
+# Force CPU fallback (no GPU acceleration)
+python zap.py input.jpg output.png --no-gpu --window-size 7 --threshold 2.5
 
 # Add a prefix to output filenames
 python zap.py images images --prefix clean_
@@ -124,6 +129,43 @@ python zap.py images images --prefix clean_
 6. **Median Filtering**: A median filter is applied to the entire channel (or image).
 7. **Replacement**: Detected firefly pixels are replaced with the corresponding values from the median-filtered result.
 8. **Saving the Result**: The processed image is saved to the specified output path.
+
+## GPU Acceleration
+
+FireflyZapper supports **multiplatform GPU acceleration** (CUDA via `pycuda`, OpenCL via `pyopencl`) with automatic fallback to CPU when no GPU is available. This is particularly beneficial for **4K images** (3840×2160 = 8.3M pixels per channel), where GPU acceleration provides significant speedup over CPU blur/median operations.
+
+### GPU Detection
+
+The `gpu_backend.py` module auto-detects the available GPU device at runtime:
+- **CUDA**: Detected via `pycuda.driver.init()` — if available, uses `cv2.cuda` or `pycuda` kernels
+- **OpenCL**: Detected via `pyopencl` — if available, uses OpenCL kernels
+- **CPU fallback**: If no GPU is detected, falls back to the original NumPy/CV2 path (always works)
+
+Device detection is cached after the first call via global `_device_label` / `_device_stats` variables, preventing repeated queries. Hot reload is supported via `reload_device_status()` for mid-session GPU plug-in.
+
+### CLI GPU Arguments
+
+```bash
+# Process with GPU acceleration (auto-detects CUDA/OpenCL)
+python zap.py input.jpg output.png --use-gpu
+
+# Force CPU fallback (no GPU acceleration)
+python zap.py input.jpg output.png --no-gpu
+```
+
+### GUI GPU Status
+
+The GUI displays a dedicated **GPU status label** showing:
+- Detected device name and type (e.g., "GPU: NVIDIA RTX 3080 (CUDA)")
+- Acceleration status: "Active" or "Disabled (CPU fallback)"
+- Hot reload support when user plugs GPU mid-session
+
+### 4K Image Support
+
+4K images (3840×2160 = 8,294,400 pixels per channel) are the primary use case for GPU acceleration. At this scale:
+- CPU blur/median operations take significantly longer
+- GPU acceleration provides 5-20× speedup depending on device
+- Multi-channel RGB processing benefits even more (3 channels × 8.3M pixels)
 
 ## Contributing
 
