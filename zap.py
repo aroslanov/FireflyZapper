@@ -85,7 +85,7 @@ def write_exr(filename, data, compression=None):
     out.writePixels({'R': R, 'G': G, 'B': B})
     out.close()
 
-def process_channel(channel, window_size, threshold, use_gpu=True):
+def process_channel(channel, window_size, threshold, use_gpu=True) -> np.ndarray:
     """
     Process a single channel to remove fireflies using local statistics and median filtering.
     Supports multiplatform GPU acceleration (CUDA/OpenCL) when available,
@@ -170,14 +170,15 @@ def process_image(input_path, output_path, window_size, threshold, use_gpu=True)
         image = image.astype(np.float32) / 255.0
 
     # GPU acceleration for 4K+ images — dispatch to gpu_backend if available
+    result: np.ndarray
     if use_gpu and is_gpu_active():
         result = process_image_gpu(image, window_size, threshold, device_label=get_device())
     else:
         # CPU fallback — original NumPy/CV2 path
         if len(image.shape) == 3:
-            channels = cv2.split(image)
+            channels = [image[:, :, i] for i in range(image.shape[2])]
             processed_channels = [process_channel(chan, window_size, threshold, use_gpu=False) for chan in channels]
-            result = cv2.merge(processed_channels)
+            result = np.stack(processed_channels, axis=2)
         else:
             result = process_channel(image, window_size, threshold, use_gpu=False)
 
@@ -190,7 +191,7 @@ def process_image(input_path, output_path, window_size, threshold, use_gpu=True)
         if output_path.endswith('.exr'):
             write_exr(output_path, result, compression)
         else:
-            cv2.imwrite(output_path, result)
+            cv2.imwrite(str(output_path), result)
     except Exception as e:
         raise RuntimeError(f"Failed to write output image: {str(e)}")
 

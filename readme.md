@@ -12,7 +12,8 @@ FireflyZapper removes fireflies (hot pixels, bright spots, or specular artifacts
 - **Z-Score Thresholding**: Identifies fireflies based on a customizable z-score threshold.
 - **Median Filtering**: Replaces detected firefly pixels with median-filtered values from their neighborhood.
 - **Supports Grayscale, Color Images, and EXR Format**: Processes each color channel separately to handle color images effectively. Additionally, it supports high dynamic range (HDR) images in the EXR format.
-- **Graphical User Interface** (`zap_gui.py`): PySide6-based GUI with interactive previews, zoom/pan, preset management, and sequence processing.
+- **GPU Acceleration** (optional): Custom CUDA and OpenCL kernels for box filter, variance, and median replacement — up to **78× speedup** per channel on supported hardware.
+- **Graphical User Interface** (`zap_gui.py`): PySide6-based GUI with interactive previews, zoom/pan, preset management, GPU status display, and sequence processing.
 - **Sequence Processing**: Load an entire folder of images, scrub through frames, and batch-render the whole sequence.
 - **Preset Management**: Save/load/delete parameter presets for quick switching between configurations.
 
@@ -20,7 +21,7 @@ FireflyZapper removes fireflies (hot pixels, bright spots, or specular artifacts
 
 ### Requirements
 
-- Python 3.8+
+- Python 3.8+ (tested on 3.14)
 - Dependencies listed in `requirements.txt`
 
 ### Setup
@@ -41,6 +42,12 @@ source .venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
+
+# (Optional) Install GPU acceleration libraries
+# CUDA backend:
+pip install pycuda
+# OpenCL backend:
+pip install pyopencl
 ```
 
 ## GUI Usage
@@ -123,27 +130,56 @@ python zap.py images images --prefix clean_
 
 1. **Reading the Image**: The script reads the input image using OpenCV or `OpenEXR` for EXR files.
 2. **Processing Channels**: If the image is color, it splits the image into its RGB channels and processes each channel separately.
-3. **Local Statistics Calculation**: For each channel (or the entire image if grayscale), local mean and standard deviation are calculated using a specified window size.
-4. **Z-Score Computation**: The z-score for each pixel is computed based on the local statistics.
-5. **Firefly Detection**: Pixels with z-scores above the threshold are identified as fireflies.
-6. **Median Filtering**: A median filter is applied to the entire channel (or image).
-7. **Replacement**: Detected firefly pixels are replaced with the corresponding values from the median-filtered result.
-8. **Saving the Result**: The processed image is saved to the specified output path.
+3. **GPU Acceleration** (optional): If a CUDA or OpenCL device is available, the heavy compute steps (box filter, variance, median replacement) are dispatched to custom GPU kernels via `pycuda` or `pyopencl`. The CPU fallback uses NumPy/CV2.
+4. **Local Statistics Calculation**: For each channel, local mean and standard deviation are calculated using a specified window size.
+5. **Z-Score Computation**: The z-score for each pixel is computed based on the local statistics.
+6. **Firefly Detection**: Pixels with z-scores above the threshold are identified as fireflies.
+7. **Median Filtering**: A median filter is applied to the entire channel.
+8. **Replacement**: Detected firefly pixels are replaced with the corresponding values from the median-filtered result.
+9. **Saving the Result**: The processed image is saved to the specified output path.
 
 ## GPU Acceleration
 
-FireflyZapper supports **multiplatform GPU acceleration** (CUDA via `pycuda`, OpenCL via `pyopencl`) with automatic fallback to CPU when no GPU is available. This is particularly beneficial for **4K images** (3840×2160 = 8.3M pixels per channel), where GPU acceleration provides significant speedup over CPU blur/median operations.
+FireflyZapper supports **multiplatform GPU acceleration** (CUDA via `pycuda`, OpenCL via `pyopencl`) with automatic fallback to CPU when no GPU is available. This is particularly beneficial for **4K images** (3840×2160 = 8.3M pixels per channel), where GPU acceleration provides significant speedup over CPU operations.
 
 ### GPU Detection
 
 The `gpu_backend.py` module auto-detects the available GPU device at runtime:
-- **CUDA**: Detected via `pycuda.driver.init()` — if available, uses a PyCUDA kernel
+- **CUDA**: Detected via `pycuda.driver.init()` — if available, uses custom CUDA kernels
 - **OpenCL**: Detected via `pyopencl` — if available, uses OpenCL kernels
 - **CPU fallback**: If no GPU is detected, falls back to the original NumPy/CV2 path (always works)
 
 Device detection is cached after the first call via global `_device_label` / `_device_stats` variables, preventing repeated queries. If kernel compilation or execution fails, the backend is disabled for the session, the reason appears in the status text, and processing safely continues on the CPU. Hot reload is supported via `reload_device_status()` for mid-session GPU plug-in.
 
 GPU kernels support odd window sizes through 7×7. Larger windows remain supported and automatically use the CPU implementation.
+
+### CUDA Implementation
+
+The CUDA backend uses **custom kernels** compiled at runtime via `pycuda.compiler.SourceModule`:
+
+| Kernel | Description | Algorithm |
+|--------|-------------|-----------|
+| `box_filter_horizontal` | 1D horizontal box filter | Sliding window (O(1) per pixel) |
+| `box_filter_vertical` | 1D vertical box filter | Sliding window (O(1) per pixel) |
+| `variance_kernel` | Variance = E[X²] − E[X]² | Element-wise |
+| `sqrt_kernel` | Standard deviation | Element-wise (cached `ElementwiseKernel`) |
+| `firefly_removal_kernel` | Z-score test + median replacement | Per-pixel with insertion sort |
+
+The separable box filter (horizontal then vertical) is mathematically equivalent to OpenCV's 2D box filter but with minor floating-point differences from accumulation order. Border handling matches OpenCV defaults: `BORDER_REFLECT_101` for the box filter and `BORDER_REFLECT` for the median window.
+
+All compiled objects (`SourceModule`, `ElementwiseKernel`) are cached globally after first compilation, so subsequent calls incur no compilation overhead.
+
+### Performance Benchmarks
+
+Measured on **1080×1920 EXR frames** (window=5, threshold=3.0) with an **NVIDIA RTX PRO 6000 Blackwell Workstation Edition** (188 cores, 97,886 MB VRAM):
+
+| Operation | GPU (CUDA) | CPU (NumPy/CV2) | Speedup |
+|-----------|-----------|-----------------|---------|
+| Single channel | **8 ms** | 627 ms | **78×** |
+| Full 3-channel frame | **366 ms** | 1,935 ms | **5.3×** |
+| 36-frame sequence | **13.9 s** | ~70 s | **5×** |
+
+> **Note**: Small floating-point differences (< 1e-7 relative) between GPU and CPU results are expected due to the separable vs 2D box filter accumulation order. These affect only a handful of pixels near the firefly threshold and do not impact visual quality.
 
 ### CLI GPU Arguments
 
@@ -158,16 +194,9 @@ python zap.py input.jpg output.png --no-gpu
 ### GUI GPU Status
 
 The GUI displays a dedicated **GPU status label** showing:
-- Detected device name and type (e.g., "GPU: NVIDIA RTX 3080 (CUDA)")
+- Detected device name and type (e.g., "GPU: NVIDIA RTX PRO 6000 (CUDA)")
 - Acceleration status: "Active" or "Disabled (CPU fallback)"
 - Hot reload support when user plugs GPU mid-session
-
-### 4K Image Support
-
-4K images (3840×2160 = 8,294,400 pixels per channel) are the primary use case for GPU acceleration. At this scale:
-- CPU blur/median operations take significantly longer
-- GPU acceleration provides 5-20× speedup depending on device
-- Multi-channel RGB processing benefits even more (3 channels × 8.3M pixels)
 
 ### Tests
 

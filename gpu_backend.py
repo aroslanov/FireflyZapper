@@ -352,7 +352,7 @@ def process_channel_cpu(channel, window_size, threshold, return_mask=False):
 
 def process_channel_gpu(
     channel, window_size, threshold, device_label=None, return_mask=False
-):
+) -> np.ndarray:
     """Process one channel, safely and truthfully falling back to the CPU."""
     channel_float = np.asarray(channel, dtype=np.float32)
     label = device_label or get_device()
@@ -385,7 +385,7 @@ def process_channel_gpu(
 
 def process_image_gpu(
     image, window_size, threshold, device_label=None, return_mask=False
-):
+) -> np.ndarray:
     """Process an image and optionally return its combined detection mask."""
     image_float = np.asarray(image, dtype=np.float32)
     label = device_label or get_device()
