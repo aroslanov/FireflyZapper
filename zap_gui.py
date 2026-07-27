@@ -85,8 +85,8 @@ def process_image_full(image, window_size, threshold, use_gpu=True):
     image_float = image.astype(np.float32)
 
     # Auto-detect GPU device — cached after first call
-    device_label = get_device if use_gpu else "cpu"
-    if use_gpu and is_gpu_active:
+    device_label = get_device() if use_gpu else "cpu"
+    if use_gpu and is_gpu_active():
         # GPU path — dispatch to gpu_backend for channel processing
         if len(image_float.shape) == 3:
             channels = cv2.split(image_float)
@@ -126,8 +126,8 @@ def process_channel_with_mask(channel, window_size, threshold, use_gpu=True):
     with automatic fallback to CPU for unsupported platforms.
     """
     # Auto-detect GPU device (CUDA/OpenCL/CPU) — cached after first call
-    device_label = get_device if use_gpu else "cpu"
-    if use_gpu and is_gpu_active:
+    device_label = get_device() if use_gpu else "cpu"
+    if use_gpu and is_gpu_active():
         # GPU path — dispatch to gpu_backend (returns result, but mask computed on CPU for now)
         # Note: GPU backend returns processed channel; mask is derived from z_scores
         # which is computed during GPU processing. For simplicity, we compute mask on CPU
@@ -288,8 +288,8 @@ class RenderWorker(QThread):
     def run(self):
         total = len(self.frame_paths)
         # Detect GPU device once at thread start — cached for all frames
-        device_label = get_device if self.use_gpu else "cpu"
-        gpu_active = is_gpu_active if self.use_gpu else False
+        device_label = get_device() if self.use_gpu else "cpu"
+        gpu_active = is_gpu_active() if self.use_gpu else False
         if gpu_active:
             # GPU acceleration active — process all frames on GPU
             for i, fpath in enumerate(self.frame_paths):
@@ -745,12 +745,12 @@ class FireflyZapperGUI(QMainWindow):
         # Initialize GPU status text from backend
         gpu_status = get_device_status()
         self.gpu_status_label.setText(f"{gpu_status}")
-        if is_gpu_active:
+        if is_gpu_active():
             self.gpu_status_label.setText("GPU acceleration: Active")
         else:
             self.gpu_status_label.setText("GPU acceleration: Disabled (CPU fallback)")
         # Hot reload when user plugs GPU mid-session — slot will be wired later
-        self._gpu_hot_reload_slot = reload_device_status()  # function reference for hot reload
+        self._gpu_hot_reload_slot = reload_device_status  # function reference for hot reload
 
         # Splitter
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1364,9 +1364,14 @@ class FireflyZapperGUI(QMainWindow):
             total_pixels = np.size(mask)  # total elements in numpy array
             pct = 100.0 * num_fireflies / total_pixels
             # Format GPU status info — gpu_status is a string from get_device_status()
-            # Extract device name from status string (format: "Device: Name (Type)")
-            gpu_name = gpu_status.split(":")[1] if ":" in gpu_status else "unknown"
-            gpu_active = "Active" if is_gpu_active else "Disabled"
+            # Extract device name from status string
+            if "GPU:" in gpu_status:
+                # Format: "GPU: CUDA — Name (cores, MB) | Acceleration: Active"
+                gpu_name = gpu_status.split("—")[0].replace("GPU:", "").strip() if "—" in gpu_status else gpu_status.split("|")[0].strip()
+            else:
+                # Format: "CPU fallback — Name (cores) | Acceleration: Disabled"
+                gpu_name = "CPU"
+            gpu_active = "Active" if is_gpu_active() else "Disabled"
             self.status_label.setText(
                 f"Done — {num_fireflies} firefly pixels ({pct:.3f}%) detected | "
                 f"ws={ws}, th={th:.1f} | GPU: {gpu_name} acceleration {gpu_active}"
@@ -1464,7 +1469,7 @@ class FireflyZapperGUI(QMainWindow):
         # Check GPU acceleration status before starting render
         gpu_status = get_device_status()
         self.gpu_status_label.setText(f"{gpu_status}")
-        gpu_active = is_gpu_active
+        gpu_active = is_gpu_active()
         if gpu_active:
             # GPU acceleration active — pass use_gpu=True to RenderWorker
             self.render_worker = RenderWorker(

@@ -102,8 +102,8 @@ def process_channel(channel, window_size, threshold, use_gpu=True):
         np.ndarray: Processed channel with fireflies removed.
     """
     # Auto-detect GPU device (CUDA/OpenCL/CPU) — cached after first call
-    device_label = get_device if use_gpu else "cpu"
-    if use_gpu and is_gpu_active:
+    device_label = get_device() if use_gpu else "cpu"
+    if use_gpu and is_gpu_active():
         # GPU path — dispatch to gpu_backend
         result = process_channel_gpu(channel, window_size, threshold, device_label)
         return result
@@ -160,7 +160,7 @@ def process_image(input_path, output_path, window_size, threshold, use_gpu=True)
         elif image.dtype == np.float32:
             original_dtype = np.float32
         elif image.dtype == np.uint8:
-        original_dtype = np.uint8
+            original_dtype = np.uint8
         else:
             raise ValueError(f"Unsupported image type: {image.dtype}")
 
@@ -170,8 +170,8 @@ def process_image(input_path, output_path, window_size, threshold, use_gpu=True)
         image = image.astype(np.float32) / 255.0
 
     # GPU acceleration for 4K+ images — dispatch to gpu_backend if available
-    if use_gpu and is_gpu_active:
-        result = process_image_gpu(image, window_size, threshold, device_label=get_device)
+    if use_gpu and is_gpu_active():
+        result = process_image_gpu(image, window_size, threshold, device_label=get_device())
     else:
         # CPU fallback — original NumPy/CV2 path
         if len(image.shape) == 3:
@@ -270,13 +270,13 @@ def main():
     # Auto-detect GPU device for status display
     device_label = get_device()
     gpu_status = get_device_status()
-    if use_gpu_flag and is_gpu_active:
+    if use_gpu_flag and is_gpu_active():
         # GPU acceleration enabled — print device info
         print(f"GPU acceleration: {gpu_status}")
     else:
         # CPU fallback
         print(f"GPU acceleration: Disabled (CPU fallback)")
-    gpu_active = is_gpu_active if use_gpu_flag else False
+    gpu_active = is_gpu_active() if use_gpu_flag else False
 
     input_path = os.path.abspath(args.input)
     output_path = os.path.abspath(args.output)
@@ -289,6 +289,10 @@ def main():
         output_dir = output_path
 
         input_dir, output_dir, prefix = handle_same_directory(input_dir, output_dir)
+
+        # Ensure output directory exists
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
 
         for filename in os.listdir(input_dir):
             input_file_path = os.path.join(input_dir, filename)
@@ -306,6 +310,8 @@ def main():
                 output_file_path = get_output_path(input_path, output_path)
             else:
                 output_file_path = output_path
+                # Ensure parent directory exists
+                os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
 
             print(f"Processing {input_path}...")
             process_image(input_path, output_file_path, args.window_size, args.threshold, use_gpu=use_gpu_flag)
@@ -314,5 +320,5 @@ def main():
     else:
         raise ValueError("Invalid input/output paths. Please provide valid directories or files.")
 
-if __name__ = "__main__":
+if __name__ == "__main__":
     main()
